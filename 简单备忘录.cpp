@@ -1,5 +1,5 @@
 // 简单备忘录：标题+文本，多关键词搜索 + 向量语义搜索
-// 嵌入由本地 LM Studio（OpenAI 兼容 API，底层 llama.cpp）提供，禁用 Ollama
+// 嵌入由本地 llama.cpp（llama-embedding 子进程 + embeddinggemma-300m）提供，首次自动下载
 // 编译：g++.exe -Wall -Wextra -g3 -O2 -std=c++17 "简单备忘录.cpp" -o "output/简单备忘录.exe"
 
 #include <bits/stdc++.h>
@@ -33,16 +33,21 @@ static string data_dir()
 
 static string memos_path() { return data_dir() + "/memos.jsonl"; }
 static string vectors_path() { return data_dir() + "/vectors.bin"; }
-static string tmp_body_path() { return data_dir() + "/.body.json"; }
+static string llama_dir() { return data_dir() + "/llama"; }
+static string llama_server_default() { return llama_dir() + "/llama-server.exe"; }
 
-static string embed_url()
+// llama-server.exe 路径：环境变量 > 默认下载位置
+static string llama_server_path()
 {
-	return get_env("MEMO_EMBED_URL", "http://localhost:1234/v1/embeddings");
+	return get_env("MEMO_LLAMA_SERVER_EXE", llama_server_default());
 }
-static string embed_model()
-{
-	return get_env("MEMO_EMBED_MODEL", "text-embedding-nomic-embed-text-v1.5");
-}
+// 本地 embedding server 端口
+static int server_port() { return atoi(get_env("MEMO_SERVER_PORT", "8732").c_str()); }
+// 嵌入模型（embeddinggemma-300m Q8_0，官方 GGUF）
+static string embed_hf_repo() { return get_env("MEMO_EMBED_HF_REPO", "ggml-org/embeddinggemma-300M-GGUF"); }
+static string embed_hf_file() { return get_env("MEMO_EMBED_HF_FILE", "embeddinggemma-300M-Q8_0.gguf"); }
+// HF 镜像（国内加速；置空用官方）
+static string hf_endpoint() { return get_env("MEMO_HF_ENDPOINT", "https://hf-mirror.com"); }
 
 static bool ensure_data_dir()
 {
@@ -270,54 +275,183 @@ static string json_escape(const string& s)
 	return r;
 }
 
-// ===================== HTTP（curl 子进程） =====================
-// 请求体写入临时文件，避免命令行转义地狱；响应从 curl stdout 读取
-static string http_post_json(const string& url, const string& body)
+// ===================== 网络（curl 子进程） =====================
+// GET 取文本响应（用于查 GitHub release API）
+// 用 system 重定向到文件再读，避免 MinGW _popen 管道读取问题
+static string http_get(const string& url)
 {
 	ensure_data_dir();
-	string bf = tmp_body_path();
-	ofstream f(bf, ios::binary);
-	f << body;
-	f.close();
-
-	string cmd = "curl -s -m 60 -X POST -H \"Content-Type: application/json\" --data-binary \"@";
-	cmd += bf;
-	cmd += "\" \"";
-	cmd += url;
-	cmd += "\"";
-
-	FILE* p = _popen(cmd.c_str(), "r");
-	if (!p) return "";
+	string out = data_dir() + "/.get.txt";
+	string cmd = "curl -s -L -m 60 -A \"simple-memo\" \"" + url + "\" > \"" + out + "\" 2>nul";
+	system(cmd.c_str());
 	string resp;
-	char buf[8192];
-	while (fgets(buf, sizeof(buf), p)) resp += buf;
-	_pclose(p);
+	ifstream f(out, ios::binary);
+	if (f) resp = string((istreambuf_iterator<char>(f)), istreambuf_iterator<char>());
 	return resp;
 }
 
-// ===================== Embedding =====================
+// GET 下载到文件（用于下载 llama.cpp release zip）
+static bool curl_download(const string& url, const string& dest)
+{
+	string cmd = "curl -s -L -m 600 --retry 2 -A \"simple-memo\" -o \"" + dest + "\" \"" + url + "\"";
+	int rc = system(cmd.c_str());
+	if (rc != 0) return false;
+	ifstream f(dest, ios::binary | ios::ate);
+	return f && f.tellg() > 0;
+}
+
+// ===================== Embedding（llama.cpp 子进程） =====================
 static string g_last_err;
+
+// 查 llama.cpp 最新 release 的 Windows AVX2 zip 下载地址
+static string find_llama_release_url()
+{
+	string resp = http_get("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest");
+	if (resp.empty()) return "";
+	Json j = json_parse(resp);
+	Json* assets = j.find("assets");
+	if (!assets || assets->t != Json::Arr) return "";
+	string avx2, fallback;
+	for (auto& a : assets->arr)
+	{
+		Json* name = a.find("name");
+		Json* url = a.find("browser_download_url");
+		if (!name || !url || url->t != Json::Str) continue;
+		// 新版 llama.cpp 用 bin-win-cpu-x64（旧版 bin-win-avx2-x64）
+		const string& n = name->s;
+		if (n.find("bin-win-cpu-x64") != string::npos || n.find("bin-win-avx2-x64") != string::npos) avx2 = url->s;
+		else if (n.find("bin-win-x64") != string::npos && fallback.empty()) fallback = url->s;
+	}
+	return !avx2.empty() ? avx2 : fallback;
+}
+
+// 确保 llama-server.exe 可用；首次自动下载解压。失败设 g_last_err 返回 false
+static bool ensure_llama_binary()
+{
+	string exe = llama_server_path();
+	{ ifstream t(exe, ios::binary); if (t) return true; }
+
+	const char* envExe = getenv("MEMO_LLAMA_SERVER_EXE");
+	if (envExe && *envExe)
+	{
+		g_last_err = string("MEMO_LLAMA_SERVER_EXE 指定的文件不存在: ") + exe;
+		return false;
+	}
+
+	ensure_data_dir();
+	printf("首次使用：正在获取 llama.cpp（下载 + 解压，请耐心等待）...\n");
+
+	string url = find_llama_release_url();
+	if (url.empty()) { g_last_err = "无法获取 llama.cpp 最新 release 地址（网络？请开 WARP/代理）"; return false; }
+
+	string zip = data_dir() + "/llama-release.zip";
+	printf("  下载 %s\n", url.c_str());
+	if (!curl_download(url, zip))
+	{
+		g_last_err = "下载 llama.cpp release 失败（github.com 可能被墙，请开 WARP/代理后重试）";
+		return false;
+	}
+
+	error_code ec;
+	filesystem::create_directories(llama_dir(), ec);
+	string untar = "tar -xf \"" + zip + "\" -C \"" + llama_dir() + "\"";
+	int rc = system(untar.c_str());
+	filesystem::remove(zip, ec);
+	if (rc != 0) { g_last_err = "解压 llama.cpp release 失败"; return false; }
+
+	{ ifstream t(llama_server_default(), ios::binary); if (!t) { g_last_err = "解压后未找到 llama-server.exe"; return false; } }
+	printf("  llama.cpp 就绪。\n");
+	return true;
+}
+
+// POST JSON 到本地 llama-server
+static string http_post_json(const string& url, const string& body)
+{
+	ensure_data_dir();
+	string bf = data_dir() + "/.body.json";
+	{ ofstream f(bf, ios::binary); f << body; }
+	string out = data_dir() + "/.post.txt";
+	string cmd = "curl -s -m 60 -X POST -H \"Content-Type: application/json\" --data-binary \"@" + bf + "\" \"" + url + "\" > \"" + out + "\" 2>nul";
+	system(cmd.c_str());
+	string resp;
+	ifstream f(out, ios::binary);
+	if (f) resp = string((istreambuf_iterator<char>(f)), istreambuf_iterator<char>());
+	return resp;
+}
+
+// llama-server 是否就绪（/health 返回 HTTP 200；模型加载中是 503）
+static bool server_health()
+{
+	ensure_data_dir();
+	string codef = data_dir() + "/.code.txt";
+	string cmd = "curl -s -m 10 -w \"%{http_code}\" -o nul \"http://127.0.0.1:" + to_string(server_port()) + "/health\" > \"" + codef + "\" 2>nul";
+	system(cmd.c_str());
+	string code;
+	ifstream f(codef);
+	if (f) getline(f, code);
+	return code.find("200") != string::npos;
+}
+
+// 启动并等待 llama-server 就绪；已运行则复用
+static bool ensure_server()
+{
+	if (server_health()) return true;
+	if (!ensure_llama_binary()) return false;
+
+	// 注入 HF_ENDPOINT 给 server 子进程（国内加速模型下载）
+	string hfEp = hf_endpoint();
+	if (!hfEp.empty()) _putenv(("HF_ENDPOINT=" + hfEp).c_str());
+
+	printf("  启动 llama-server（首次下载+加载模型，可能需 1-2 分钟）...\n");
+	string cmd = "start \"memo-embd\" /B \"" + llama_server_path() + "\""
+		+ " --embedding"
+		+ " --host 127.0.0.1 --port " + to_string(server_port())
+		+ " -hf \"" + embed_hf_repo() + "\""
+		+ " --hf-file \"" + embed_hf_file() + "\""
+		+ " > nul 2>nul";
+	system(cmd.c_str());
+
+	for (int i = 0; i < 240; i++) // 最多等 120 秒（模型下载 + 加载）
+	{
+		Sleep(500);
+		if (server_health()) { printf("  llama-server 就绪。\n"); return true; }
+	}
+	g_last_err = "llama-server 启动超时（首次下载模型较久，请重试）";
+	return false;
+}
+
+// 程序退出时清理 server
+static void kill_server()
+{
+	system("taskkill /IM llama-server.exe /F >nul 2>nul");
+}
 
 // 成功返回向量；失败返回空并设置 g_last_err
 static vector<float> embed_text(const string& text)
 {
 	g_last_err.clear();
-	string body = "{\"model\":" + json_escape(embed_model()) + ",\"input\":" + json_escape(text) + "}";
-	string resp = http_post_json(embed_url(), body);
-	if (resp.empty()) { g_last_err = "curl 无响应（LM Studio 未启动或端口不对？）"; return {}; }
-
-	Json j = json_parse(resp);
-	if (Json* err = j.find("error"))
+	if (!ensure_server())
 	{
-		Json* msg = err->find("message");
-		g_last_err = msg ? msg->s : "embedding API 返回错误";
+		if (g_last_err.empty()) g_last_err = "llama-server 不可用";
 		return {};
 	}
-	Json* data = j.find("data");
-	if (!data || data->t != Json::Arr || data->arr.empty()) { g_last_err = "响应缺少 data 字段"; return {}; }
-	Json* emb = data->arr[0].find("embedding");
-	if (!emb || emb->t != Json::Arr) { g_last_err = "响应缺少 embedding 数组"; return {}; }
 
+	string body = "{\"input\":" + json_escape(text) + "}";
+	string resp = http_post_json("http://127.0.0.1:" + to_string(server_port()) + "/v1/embeddings", body);
+	if (resp.empty()) { g_last_err = "embedding 请求无响应"; return {}; }
+
+	// 解析 OpenAI 兼容 JSON（兼容 data[0].embedding 和顶层 embedding）
+	Json j = json_parse(resp);
+	Json* emb = nullptr;
+	Json* data = j.find("data");
+	if (data && data->t == Json::Arr && !data->arr.empty())
+		emb = data->arr[0].find("embedding");
+	if (!emb) emb = j.find("embedding");
+	if (!emb || emb->t != Json::Arr)
+	{
+		g_last_err = "响应缺少 embedding 数组（原始: " + resp.substr(0, 200) + ")";
+		return {};
+	}
 	vector<float> v;
 	v.reserve(emb->arr.size());
 	for (auto& x : emb->arr) if (x.t == Json::Num) v.push_back((float)x.num);
@@ -483,7 +617,7 @@ static int cmd_add(vector<string>& args)
 		m.vec_ok = false;
 		printf("已新增 #%-4lld（警告：embedding 失败，标记 pending）\n", id);
 		printf("  原因：%s\n", g_last_err.c_str());
-		printf("  启动 LM Studio 后运行 reindex 补算。\n");
+		printf("  解决后运行 reindex 补算。\n");
 	}
 	ms.push_back(m);
 	save_memos(ms);
@@ -699,7 +833,8 @@ static void print_help()
 		"  reindex [--all]        补算 pending / 全量重建\n"
 		"  help                   帮助\n"
 		"  quit                   退出（仅 REPL）\n"
-		"环境变量：MEMO_EMBED_URL, MEMO_EMBED_MODEL, MEMO_DATA_DIR\n");
+		"环境变量：MEMO_DATA_DIR, MEMO_LLAMA_EMBEDDING_EXE,\n"
+		"          MEMO_EMBED_HF_REPO, MEMO_EMBED_HF_FILE, MEMO_HF_ENDPOINT\n");
 }
 
 static int dispatch(vector<string>& args)
@@ -726,6 +861,7 @@ int main(int argc, char** argv)
 	SetConsoleOutputCP(65001);
 	SetConsoleCP(65001);
 	ensure_data_dir();
+	atexit(kill_server);
 
 	// 子命令模式：直接执行
 	if (argc > 1)

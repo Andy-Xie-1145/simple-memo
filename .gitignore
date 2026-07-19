@@ -8,7 +8,20 @@ output/
 # 测试数据 / test data
 .test_data/
 
-# 临时文件 / temp
+# 备忘录运行时数据/缓存（若 MEMO_DATA_DIR 设到仓库内，防止误入库）
+memos.jsonl
+vectors.bin
+llama/
+llama-release.zip
 .body.json
+.post.txt
+.get.txt
+.code.txt
+.health.txt
+.embed.json
+.prompt.txt
+.diag.log
+
+# 临时文件 / temp
 *.tmp
 *.log
