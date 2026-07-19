@@ -325,17 +325,33 @@ static string find_llama_release_url()
 	return !avx2.empty() ? avx2 : fallback;
 }
 
-// 确保 llama-server.exe 可用；首次自动下载解压。失败设 g_last_err 返回 false
+// 验证 llama-server.exe 可正常执行（--version 打印版本后退出，不启动 server）
+static bool llama_server_works()
+{
+	string cmd = "\"" + llama_server_path() + "\" --version > nul 2>nul";
+	return system(cmd.c_str()) == 0;
+}
+
+// 确保 llama-server.exe 可用；已存在但损坏则清理重下（自愈）。失败设 g_last_err
 static bool ensure_llama_binary()
 {
-	string exe = llama_server_path();
-	{ ifstream t(exe, ios::binary); if (t) return true; }
+	// 已存在且可执行 → 跳过
+	if (llama_server_works()) return true;
 
+	// 用户用环境变量显式指定却不可用 → 不自动重下，直接报错
 	const char* envExe = getenv("MEMO_LLAMA_SERVER_EXE");
 	if (envExe && *envExe)
 	{
-		g_last_err = string("MEMO_LLAMA_SERVER_EXE 指定的文件不存在: ") + exe;
+		g_last_err = string("MEMO_LLAMA_SERVER_EXE 指定的文件不可用: ") + llama_server_path();
 		return false;
+	}
+
+	// 默认位置存在但损坏/不完整 → 清理后重下（自愈）
+	error_code ec;
+	if (filesystem::exists(llama_server_default(), ec))
+	{
+		printf("  llama-server.exe 不可用（损坏/不完整？），清理后重新下载...\n");
+		filesystem::remove_all(llama_dir(), ec);
 	}
 
 	ensure_data_dir();
@@ -352,14 +368,13 @@ static bool ensure_llama_binary()
 		return false;
 	}
 
-	error_code ec;
 	filesystem::create_directories(llama_dir(), ec);
 	string untar = "tar -xf \"" + zip + "\" -C \"" + llama_dir() + "\"";
 	int rc = system(untar.c_str());
 	filesystem::remove(zip, ec);
 	if (rc != 0) { g_last_err = "解压 llama.cpp release 失败"; return false; }
 
-	{ ifstream t(llama_server_default(), ios::binary); if (!t) { g_last_err = "解压后未找到 llama-server.exe"; return false; } }
+	if (!llama_server_works()) { g_last_err = "下载后 llama-server.exe 仍不可用（zip 可能损坏，请重试）"; return false; }
 	printf("  llama.cpp 就绪。\n");
 	return true;
 }
@@ -402,21 +417,31 @@ static bool ensure_server()
 	string hfEp = hf_endpoint();
 	if (!hfEp.empty()) _putenv(("HF_ENDPOINT=" + hfEp).c_str());
 
-	printf("  启动 llama-server（首次下载+加载模型，可能需 1-2 分钟）...\n");
+	printf("  启动 llama-server（首次下载+加载模型，可能需几分钟）...\n");
+	ensure_data_dir();
+	string logf = data_dir() + "/server.log";
 	string cmd = "start \"memo-embd\" /B \"" + llama_server_path() + "\""
 		+ " --embedding"
 		+ " --host 127.0.0.1 --port " + to_string(server_port())
 		+ " -hf \"" + embed_hf_repo() + "\""
 		+ " --hf-file \"" + embed_hf_file() + "\""
-		+ " > nul 2>nul";
+		+ " > nul 2> \"" + logf + "\"";
 	system(cmd.c_str());
 
-	for (int i = 0; i < 240; i++) // 最多等 120 秒（模型下载 + 加载）
+	for (int i = 0; i < 600; i++) // 最多等 300 秒（首次模型下载 + 加载）
 	{
 		Sleep(500);
 		if (server_health()) { printf("  llama-server 就绪。\n"); return true; }
 	}
-	g_last_err = "llama-server 启动超时（首次下载模型较久，请重试）";
+	// 超时：dump server.log 末尾帮助诊断
+	g_last_err = "llama-server 启动超时（首次下载模型较久，请重试）。server.log 末尾：\n";
+	ifstream lf(logf, ios::binary);
+	if (lf)
+	{
+		string log((istreambuf_iterator<char>(lf)), istreambuf_iterator<char>());
+		if (log.size() > 800) log = "..." + log.substr(log.size() - 800);
+		g_last_err += log;
+	}
 	return false;
 }
 
@@ -819,6 +844,13 @@ static int cmd_reindex(vector<string>& args)
 	return 0;
 }
 
+static int cmd_stop(vector<string>&)
+{
+	kill_server();
+	printf("已停止 llama-server。\n");
+	return 0;
+}
+
 static void print_help()
 {
 	printf(
@@ -831,9 +863,10 @@ static void print_help()
 		"  delete <id>            删除\n"
 		"  edit <id> <标题> [正文] 编辑（自动重算向量）\n"
 		"  reindex [--all]        补算 pending / 全量重建\n"
+		"  stop                   停止后台 llama-server（释放内存）\n"
 		"  help                   帮助\n"
 		"  quit                   退出（仅 REPL）\n"
-		"环境变量：MEMO_DATA_DIR, MEMO_LLAMA_EMBEDDING_EXE,\n"
+		"环境变量：MEMO_DATA_DIR, MEMO_LLAMA_SERVER_EXE, MEMO_SERVER_PORT,\n"
 		"          MEMO_EMBED_HF_REPO, MEMO_EMBED_HF_FILE, MEMO_HF_ENDPOINT\n");
 }
 
@@ -850,6 +883,7 @@ static int dispatch(vector<string>& args)
 	if (c == "delete" || c == "del" || c == "rm") return cmd_delete(rest);
 	if (c == "edit") return cmd_edit(rest);
 	if (c == "reindex") return cmd_reindex(rest);
+	if (c == "stop") return cmd_stop(rest);
 	if (c == "help" || c == "?") { print_help(); return 0; }
 	if (c == "quit" || c == "exit" || c == "q") { printf("（quit 仅在 REPL 下使用）\n"); return 0; }
 	printf("未知命令：%s（输入 help 查看）\n", c.c_str());
@@ -861,7 +895,6 @@ int main(int argc, char** argv)
 	SetConsoleOutputCP(65001);
 	SetConsoleCP(65001);
 	ensure_data_dir();
-	atexit(kill_server);
 
 	// 子命令模式：直接执行
 	if (argc > 1)
