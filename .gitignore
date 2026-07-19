@@ -1,0 +1,14 @@
+# 编译产物 / build artifacts
+output/
+*.exe
+*.o
+*.obj
+*.a
+
+# 测试数据 / test data
+.test_data/
+
+# 临时文件 / temp
+.body.json
+*.tmp
+*.log
