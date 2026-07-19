@@ -448,11 +448,15 @@ static int cmd_add(vector<string>& args)
 	}
 	if (body.empty() && g_repl)
 	{
-		printf("请输入正文（独占一行输入 :end 结束）：\n");
+		printf("请输入正文（单独一行输入 :end 或 end 结束；或按 Ctrl+Z 回车结束）：\n");
 		string line;
 		while (getline(cin, line))
 		{
-			if (line == ":end") break;
+			// 去掉行尾 \r/空白（兼容 Windows CRLF、误输空格等）
+			while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
+				line.pop_back();
+			string tl = lower(line);
+			if (tl == ":end" || tl == "end" || tl == "：end" || tl == ".end") break;
 			if (!body.empty()) body += "\n";
 			body += line;
 		}
