@@ -75,3 +75,12 @@ memo> quit
 - `memos.jsonl`：一行一条，字段 `id` / `title` / `body` / `ctime` / `vec_ok`，人可读、可 grep
 - `vectors.bin`：向量按 id 索引，紧凑二进制
 - `llama/`：自动下载的 llama.cpp（`llama-server.exe` + 依赖 dll）
+
+## 许可证
+
+- **本程序**（`简单备忘录.cpp`）：[GPL-3.0](LICENSE)（copyleft，修改并分发须同样以 GPL-3.0 开源）
+- **llama.cpp**（首次运行自动下载）：MIT License
+- **embeddinggemma-300m**（首次运行自动下载）：受 [Google Gemma Terms of Use](https://ai.google.dev/gemma/terms) 约束
+
+> 预编译 release exe（静态链接、自包含）见 [Releases](../../releases)，首次运行需联网自动下载上述依赖（国内建议开 WARP/代理）。
+
