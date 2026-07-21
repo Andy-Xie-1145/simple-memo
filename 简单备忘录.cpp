@@ -451,6 +451,16 @@ static void kill_server()
 	system("taskkill /IM llama-server.exe /F >nul 2>nul");
 }
 
+// embeddinggemma 是非对称检索模型，文档/查询需各自前缀（model card 要求）
+static string doc_prompt(const string& title, const string& body)
+{
+	return "title: " + (title.empty() ? string("none") : title) + " | text: " + body;
+}
+static string query_prompt(const string& q)
+{
+	return "task: search result | query: " + q;
+}
+
 // 成功返回向量；失败返回空并设置 g_last_err
 static vector<float> embed_text(const string& text)
 {
@@ -626,9 +636,7 @@ static int cmd_add(vector<string>& args)
 	ll id = next_id(ms);
 	Memo m{ id, title, body, now_iso(), false };
 
-	string text = title;
-	if (!body.empty()) text += "\n" + body;
-	auto v = embed_text(text);
+	auto v = embed_text(doc_prompt(title, body));
 
 	auto vs = load_vectors();
 	if (!v.empty())
@@ -725,7 +733,7 @@ static int cmd_find(vector<string>& args)
 	string q;
 	for (size_t i = 0; i < parts.size(); i++) { if (i) q += " "; q += parts[i]; }
 
-	auto qv = embed_text(q);
+	auto qv = embed_text(query_prompt(q));
 	if (qv.empty())
 	{
 		printf("无法向量化查询，语义搜索中止。\n  原因：%s\n", g_last_err.c_str());
@@ -793,9 +801,7 @@ static int cmd_edit(vector<string>& args)
 			for (size_t i = 2; i < args.size(); i++) { if (i > 2) nb += " "; nb += args[i]; }
 			m.body = nb;
 		}
-		string text = m.title;
-		if (!m.body.empty()) text += "\n" + m.body;
-		auto v = embed_text(text);
+		auto v = embed_text(doc_prompt(m.title, m.body));
 
 		auto vs = load_vectors();
 		if (!v.empty())
@@ -831,9 +837,7 @@ static int cmd_reindex(vector<string>& args)
 	{
 		if (!all && m.vec_ok) continue;
 		cnt++;
-		string text = m.title;
-		if (!m.body.empty()) text += "\n" + m.body;
-		auto v = embed_text(text);
+		auto v = embed_text(doc_prompt(m.title, m.body));
 		if (!v.empty()) { vs[m.id] = v; m.vec_ok = true; ok++; }
 		else printf("  #%lld 失败：%s\n", m.id, g_last_err.c_str());
 	}
