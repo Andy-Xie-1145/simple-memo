@@ -78,7 +78,7 @@ memo> quit
 
 ## 许可证
 
-- **本程序**（`简单备忘录.cpp`）：[GPL-3.0](LICENSE)（copyleft，修改并分发须同样以 GPL-3.0 开源）
+- **本程序**（`简单备忘录.cpp`）：[MIT](LICENSE)
 - **llama.cpp**（首次运行自动下载）：MIT License
 - **embeddinggemma-300m**（首次运行自动下载）：受 [Google Gemma Terms of Use](https://ai.google.dev/gemma/terms) 约束
 
