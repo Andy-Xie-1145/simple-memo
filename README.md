@@ -33,7 +33,7 @@ g++ -static -static-libgcc -static-libstdc++ -Wall -Wextra -O2 -std=c++17 "简�
 Linux / macOS:
 
 ```bash
-g++ -Wall -Wextra -O2 -std=c++17 简单备忘录.cpp -o simple-memo
+g++ -Wall -Wextra -O2 -std=c++17 simple-memo.cpp -o simple-memo
 ```
 
 Runtime deps: `curl` (server/download), `tar` or `unzip` (first-run llama.cpp extract). 运行依赖 `curl`、`tar`/`unzip`（首次解压 llama.cpp）。

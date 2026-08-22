@@ -1,6 +1,6 @@
 // 简单备忘录：标题+文本，多关键词搜索 + 向量语义搜索
 // 嵌入由本地 llama.cpp（llama-embedding 子进程 + embeddinggemma-300m）提供，首次自动下载
-// 编译：g++.exe -Wall -Wextra -g3 -O2 -std=c++17 "简单备忘录.cpp" -o "output/简单备忘录.exe"
+// 编译：g++ -static -static-libgcc -static-libstdc++ -Wall -Wextra -O2 -std=c++17 simple-memo.cpp -o simple-memo.exe
 
 // 显式标准头（不依赖 GCC 专属的 bits/stdc++.h，clang/libc++ 也可编译）
 #include <algorithm>

@@ -5,3 +5,6 @@ docs/
 
 # 构建产物
 output/
+simple-memo
+simple-memo.exe
+simple-memo.exe.old
