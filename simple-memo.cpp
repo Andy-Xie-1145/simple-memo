@@ -184,8 +184,9 @@ static map<string, string> load_config_map()
 static void save_config_map(const map<string, string>& m)
 {
 	ensure_data_dir();
-	ofstream f(config_file(), ios::trunc);
-	for (auto& kv : m) f << kv.first << "=" << kv.second << "\n";
+	string buf;
+	for (auto& kv : m) { buf += kv.first; buf += '='; buf += kv.second; buf += '\n'; }
+	write_file_atomic(config_file(), buf);
 	g_lang_cache = -1; // 语言等配置变更 → 缓存失效，立即生效
 }
 
@@ -1540,7 +1541,7 @@ static int cmd_find(vector<string>& args)
 		return 0;
 	}
 	sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.score > b.score; });
-	g_last_active_id = ranked[0].m->id; // find 第一匹配即为上一个活跃备忘录
+	memo_touch(ranked[0].m->id); // find 第一匹配即为上一个活跃备忘录
 
 	int shown = min((int)ranked.size(), n > 0 ? n : 5);
 	printf(tr("Top-%d 语义匹配：\n", "Top-%d semantic matches:\n"), shown);
@@ -1797,11 +1798,12 @@ static int cmd_edit(vector<string>& args)
 				else
 				{
 					m.vec_ok = false;
+					vs.erase(id); // 旧向量已过期（正文变了），清掉防脏数据
 					save_memos(ms);
 					save_vectors(vs);
 					printf(tr("已编辑 #%lld（embedding 失败 %d 段，标记 pending", "Edited #%lld (embedding failed for %d paras, marked pending"), id, fail_cnt);
 					if (!g_last_err.empty()) printf(tr("：%s", ": %s"), g_last_err.c_str());
-				printf(tr("）\n", ")\n"));
+					printf(tr("）\n", ")\n"));
 				}
 				return 0;
 			}
@@ -1841,7 +1843,11 @@ static int cmd_reindex(vector<string>& args)
 			else { done = false; printf(tr("  #%lld 失败：%s\n", "  #%lld failed: %s\n"), m.id, g_last_err.c_str()); }
 		}
 		if (done && !set.empty()) { vs[m.id] = set; m.vec_ok = true; ok++; }
-		else m.vec_ok = false;
+		else
+		{
+			vs.erase(m.id); // 本次失败 → 清旧向量，防 reindex --all 半途而废留下过期数据
+			m.vec_ok = false;
+		}
 	}
 	save_memos(ms);
 	save_vectors(vs);
@@ -2149,11 +2155,13 @@ static int fetch_latest_release(string& tag, string& asset_url, string& asset_na
 	Json* assets = j.find("assets");
 	if (!t || t->t != Json::Str || !assets || assets->t != Json::Arr) return 1;
 	tag = t->s;
-	// 优先精确本平台资产名（Win: simple-memo.exe；Unix: simple-memo），其次同前缀的其他二进制资产
+	// 优先精确本平台资产名（与 CI release.yml 的产物名一致），其次同前缀的其他二进制资产
 #ifdef _WIN32
 	const string exact = "simple-memo.exe";
+#elif defined(__APPLE__)
+	const string exact = "simple-memo-macos";
 #else
-	const string exact = "simple-memo";
+	const string exact = "simple-memo-linux";
 #endif
 	for (auto& a : assets->arr)
 	{
@@ -2250,12 +2258,17 @@ static int cmd_update(vector<string>& args)
 		return 1;
 	}
 	filesystem::copy_file(tmp, self, filesystem::copy_options::overwrite_existing, ec);
-	filesystem::remove(tmp, ec);
 	if (ec)
 	{
-		printf(tr("写入新版本失败：%s。旧版本已保留在 %s。\n", "Failed to write the new version: %s. The old one is kept at %s.\n"), ec.message().c_str(), self.c_str());
+		// 写入失败 → 回滚：把旧版本改名放回，避免程序丢失
+		error_code rcec;
+		filesystem::rename(old, self, rcec);
+		printf(tr("写入新版本失败：%s。已恢复旧版本%s。\n", "Failed to write the new version: %s. Old version restored%s.\n"),
+		       ec.message().c_str(), rcec ? tr("（但原 %s.old 保留）", " (but %s.old kept)") : "", old.c_str());
+		filesystem::remove(tmp, rcec);
 		return 1;
 	}
+	filesystem::remove(tmp, ec);
 #ifndef _WIN32
 	// 下载的文件无执行位 → 补 chmod +x，否则替换后无法运行
 	(void)system(("chmod +x \"" + self + "\" 2>/dev/null").c_str());
