@@ -34,6 +34,13 @@
 #include <windows.h>
 #else
 #include <clocale>
+#include <unistd.h>   // getpid / usleep / readlink
+#include <sys/types.h>
+#include <signal.h>   // kill（PID 存活检测）
+#include <cerrno>     // errno（EPERM）
+#ifdef __APPLE__
+#include <mach-o/dyld.h> // _NSGetExecutablePath
+#endif
 #endif
 
 using namespace std;
