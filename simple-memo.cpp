@@ -579,13 +579,16 @@ static string curl_run(const string& args, const string& out)
 static string http_get(const string& url)
 {
 	ensure_data_dir();
-	return curl_run("-s -L -m 60 -A simple-memo " + shell_quote(url), data_dir() + "/.get.txt");
+	return curl_run("-s -S -f -L -m 60 --connect-timeout 15 -A simple-memo " + shell_quote(url), data_dir() + "/.get.txt");
 }
 
 // GET 下载到文件（用于下载 llama.cpp release zip / 更新自身）
+// -# 进度条（stderr 直出终端）；-S 失败时显示 curl 错误原因；
+// -f HTTP 4xx/5xx 直接失败（不把错误页当文件存下）；
+// --connect-timeout 连接阶段快速失败（被墙 15s 内报错，不等满总超时）
 static bool curl_download(const string& url, const string& dest)
 {
-	string cmd = "curl -s -L -m 600 --retry 2 -A simple-memo -o " + shell_quote(dest) + " " + shell_quote(url);
+	string cmd = "curl -# -S -f -L -m 600 --connect-timeout 15 --retry 2 -A simple-memo -o " + shell_quote(dest) + " " + shell_quote(url);
 	int rc = system(cmd.c_str());
 	if (rc != 0) return false;
 	ifstream f(dest, ios::binary | ios::ate);
