@@ -5,10 +5,14 @@
 #include <bits/stdc++.h>
 #include <cstdio>
 #include <filesystem>
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <clocale>
+#endif
 
 using namespace std;
 using ll = long long;
@@ -70,8 +74,18 @@ static string trim(const string& s)
 	return s.substr(a, b - a + 1);
 }
 
+// 大小写不敏感：仅对 ASCII 字母生效，UTF-8 中文字节(>=0x80)在 "C" locale 下保持不变
+static string lower(const string& s)
+{
+	string r;
+	r.reserve(s.size());
+	for (unsigned char c : s) r += (char)tolower(c);
+	return r;
+}
+
 static string config_file() { return data_dir() + "/config.json"; }
 static const char* IGNORE_ENV_KEY = "@ignore_env";
+static int g_lang_cache = -1; // i18n 语言缓存（定义见 i18n 节；save 后失效）
 
 // 读 config.json：每行 key=value（value 保留 = 之后的全部，含空格）；# 开头为注释
 static map<string, string> load_config_map()
@@ -97,6 +111,7 @@ static void save_config_map(const map<string, string>& m)
 	ensure_data_dir();
 	ofstream f(config_file(), ios::trunc);
 	for (auto& kv : m) f << kv.first << "=" << kv.second << "\n";
+	g_lang_cache = -1; // 语言等配置变更 → 缓存失效，立即生效
 }
 
 // key 是否出现在 @ignore_env 列表（逗号分隔）：表示该项 config 优先于环境变量
@@ -129,21 +144,42 @@ static string get_effective(const string& key, const string& env_name, const str
 	return def;
 }
 
+// ===================== i18n / 版本 =====================
+// 本程序版本（与 GitHub Release tag 对应，update 子命令据此比较）
+static const char* MEMO_VERSION = "v0.2.0";
+static const char* MEMO_REPO = "Andy-Xie-1145/simple-memo";
+
+// 界面语言：config language / 环境变量 MEMO_LANG（zh|en，默认 zh）。
+// 结果缓存（g_lang_cache 定义于上方 config 节）；save_config_map 时失效 → REPL 内改语言立即生效。
+static bool lang_is_en()
+{
+	if (g_lang_cache < 0)
+	{
+		string l = lower(get_effective("language", "MEMO_LANG", "zh"));
+		g_lang_cache = (l == "en" || l == "english") ? 1 : 0;
+	}
+	return g_lang_cache == 1;
+}
+// 双语文案：tr("中文", "English")
+static const char* tr(const char* zh, const char* en) { return lang_is_en() ? en : zh; }
+
 // 配置项元数据（供 config 引导式交互 / get 显示）
-struct CfgItem { const char* key; const char* env; const char* desc; string(*def)(); };
+struct CfgItem { const char* key; const char* env; const char* desc; const char* desc_en; string(*def)(); };
 static string cfg_def_hf_endpoint() { return "https://hf-mirror.com"; }
 static string cfg_def_embed_repo() { return "ggml-org/embeddinggemma-300M-GGUF"; }
 static string cfg_def_embed_file() { return "embeddinggemma-300M-Q8_0.gguf"; }
 static string cfg_def_port() { return "8732"; }
 static string cfg_def_llama() { return llama_server_default(); }
 static string cfg_def_editor() { return ""; }
+static string cfg_def_lang() { return "zh"; }
 static const CfgItem g_cfg_items[] = {
-	{ "hf_endpoint", "MEMO_HF_ENDPOINT", "HF 镜像地址（国内加速，置空用官方）", cfg_def_hf_endpoint },
-	{ "embed_hf_repo", "MEMO_EMBED_HF_REPO", "嵌入模型 HF 仓库", cfg_def_embed_repo },
-	{ "embed_hf_file", "MEMO_EMBED_HF_FILE", "嵌入模型 GGUF 文件名", cfg_def_embed_file },
-	{ "server_port", "MEMO_SERVER_PORT", "本地 embedding 服务端口", cfg_def_port },
-	{ "llama_server_exe", "MEMO_LLAMA_SERVER_EXE", "llama-server.exe 路径", cfg_def_llama },
-	{ "editor", "EDITOR", "外部编辑器命令（可带参数，空=notepad）", cfg_def_editor },
+	{ "hf_endpoint", "MEMO_HF_ENDPOINT", "HF 镜像地址（国内加速，置空用官方）", "HF mirror endpoint (empty = official)", cfg_def_hf_endpoint },
+	{ "embed_hf_repo", "MEMO_EMBED_HF_REPO", "嵌入模型 HF 仓库", "Embedding model HF repo", cfg_def_embed_repo },
+	{ "embed_hf_file", "MEMO_EMBED_HF_FILE", "嵌入模型 GGUF 文件名", "Embedding model GGUF file name", cfg_def_embed_file },
+	{ "server_port", "MEMO_SERVER_PORT", "本地 embedding 服务端口", "Local embedding server port", cfg_def_port },
+	{ "llama_server_exe", "MEMO_LLAMA_SERVER_EXE", "llama-server.exe 路径", "Path to llama-server.exe", cfg_def_llama },
+	{ "editor", "EDITOR", "外部编辑器命令（可带参数，空=自动探测：Win edit→notepad / Unix nano→vi）", "External editor command (args allowed; empty = auto-detect: Win edit→notepad / Unix nano→vi)", cfg_def_editor },
+	{ "language", "MEMO_LANG", "界面语言（zh 中文 / en English）", "UI language (zh Chinese / en English)", cfg_def_lang },
 };
 
 static const CfgItem* cfg_find(const string& key)
@@ -204,18 +240,19 @@ static bool scan_config_conflicts(bool interactive)
 			cfg_set_ignore_env(m, it.key, false);
 			changed = true;
 			if (interactive)
-				printf("启动扫描：%s 的 config 与环境变量值相同，已自动删除冗余 config 项。\n", it.key);
+				printf(tr("启动扫描：%s 的 config 与环境变量值相同，已自动删除冗余 config 项。\n",
+				          "Startup scan: config %s equals its env var; removed the redundant config entry.\n"), it.key);
 			continue;
 		}
 
 		// 值不同 → 交互式二选一
 		if (!interactive) continue;
-		printf("⚠ 启动扫描发现冲突：%s（%s）\n", it.key, it.desc);
-		printf("    环境变量 %s = [%s]\n", it.env, env.c_str());
-		printf("    config  %s = [%s]\n", it.key, cfg.c_str());
-		printf("    [1] 生效 config（标记其优先于环境变量）\n");
-		printf("    [2] 生效环境变量（删除 config 项）\n");
-		printf("  请选择 [1/2]（默认 1）：");
+		printf(tr("⚠ 启动扫描发现冲突：%s（%s）\n", "⚠ Startup scan conflict: %s (%s)\n"), it.key, tr(it.desc, it.desc_en));
+		printf(tr("    环境变量 %s = [%s]\n", "    env var  %s = [%s]\n"), it.env, env.c_str());
+		printf(tr("    config  %s = [%s]\n", "    config  %s = [%s]\n"), it.key, cfg.c_str());
+		printf(tr("    [1] 生效 config（标记其优先于环境变量）\n", "    [1] keep config (mark it higher priority than env)\n"));
+		printf(tr("    [2] 生效环境变量（删除 config 项）\n", "    [2] use env var (delete the config entry)\n"));
+		printf(tr("  请选择 [1/2]（默认 1）：", "  Choose [1/2] (default 1): "));
 		fflush(stdout);
 		string choice;
 		getline(cin, choice);
@@ -224,12 +261,12 @@ static bool scan_config_conflicts(bool interactive)
 		{
 			m.erase(it.key);
 			cfg_set_ignore_env(m, it.key, false);
-			printf("    已删除 config.%s，环境变量生效。\n", it.key);
+			printf(tr("    已删除 config.%s，环境变量生效。\n", "    Deleted config.%s; the env var takes effect.\n"), it.key);
 		}
 		else
 		{
 			cfg_set_ignore_env(m, it.key, true);
-			printf("    已标记 config.%s 优先。\n", it.key);
+			printf(tr("    已标记 config.%s 优先。\n", "    Marked config.%s as priority.\n"), it.key);
 		}
 		changed = true;
 		printf("\n");
@@ -247,15 +284,6 @@ static string now_iso()
 	char buf[32];
 	strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", lt);
 	return buf;
-}
-
-// 大小写不敏感：仅对 ASCII 字母生效，UTF-8 中文字节(>=0x80)在 "C" locale 下保持不变
-static string lower(const string& s)
-{
-	string r;
-	r.reserve(s.size());
-	for (unsigned char c : s) r += (char)tolower(c);
-	return r;
 }
 
 // 简单分词：空格分隔，支持双引号包裹含空格的参数
@@ -526,7 +554,7 @@ static bool ensure_llama_binary()
 	bool user_set = !explicit_exe.empty() && explicit_exe != llama_server_default();
 	if (user_set)
 	{
-		g_last_err = string("llama-server.exe 指定的文件不可用: ") + llama_server_path();
+		g_last_err = string(tr("llama-server.exe 指定的文件不可用: ", "configured llama-server.exe is not usable: ")) + llama_server_path();
 		return false;
 	}
 
@@ -534,21 +562,24 @@ static bool ensure_llama_binary()
 	error_code ec;
 	if (filesystem::exists(llama_server_default(), ec))
 	{
-		printf("  llama-server.exe 不可用（损坏/不完整？），清理后重新下载...\n");
+		printf(tr("  llama-server.exe 不可用（损坏/不完整？），清理后重新下载...\n",
+		          "  llama-server.exe not usable (corrupt/incomplete?); cleaning and re-downloading...\n"));
 		filesystem::remove_all(llama_dir(), ec);
 	}
 
 	ensure_data_dir();
-	printf("首次使用：正在获取 llama.cpp（下载 + 解压，请耐心等待）...\n");
+	printf(tr("首次使用：正在获取 llama.cpp（下载 + 解压，请耐心等待）...\n",
+	          "First use: fetching llama.cpp (download + extract, please wait)...\n"));
 
 	string url = find_llama_release_url();
-	if (url.empty()) { g_last_err = "无法获取 llama.cpp 最新 release 地址（网络？请开 WARP/代理）"; return false; }
+	if (url.empty()) { g_last_err = tr("无法获取 llama.cpp 最新 release 地址（网络？请开 WARP/代理）", "cannot find llama.cpp latest release URL (network? try WARP/proxy)"); return false; }
 
 	string zip = data_dir() + "/llama-release.zip";
-	printf("  下载 %s\n", url.c_str());
+	printf(tr("  下载 %s\n", "  Downloading %s\n"), url.c_str());
 	if (!curl_download(url, zip))
 	{
-		g_last_err = "下载 llama.cpp release 失败（github.com 可能被墙，请开 WARP/代理后重试）";
+		g_last_err = tr("下载 llama.cpp release 失败（github.com 可能被墙，请开 WARP/代理后重试）",
+		                "failed to download llama.cpp release (github.com may be blocked; try WARP/proxy)");
 		return false;
 	}
 
@@ -556,10 +587,10 @@ static bool ensure_llama_binary()
 	string untar = "tar -xf \"" + zip + "\" -C \"" + llama_dir() + "\"";
 	int rc = system(untar.c_str());
 	filesystem::remove(zip, ec);
-	if (rc != 0) { g_last_err = "解压 llama.cpp release 失败"; return false; }
+	if (rc != 0) { g_last_err = tr("解压 llama.cpp release 失败", "failed to extract llama.cpp release"); return false; }
 
-	if (!llama_server_works()) { g_last_err = "下载后 llama-server.exe 仍不可用（zip 可能损坏，请重试）"; return false; }
-	printf("  llama.cpp 就绪。\n");
+	if (!llama_server_works()) { g_last_err = tr("下载后 llama-server.exe 仍不可用（zip 可能损坏，请重试）", "llama-server.exe still unusable after download (zip may be corrupt, retry)"); return false; }
+	printf(tr("  llama.cpp 就绪。\n", "  llama.cpp ready.\n"));
 	return true;
 }
 
@@ -599,26 +630,45 @@ static bool ensure_server()
 
 	// 注入 HF_ENDPOINT 给 server 子进程（国内加速模型下载）
 	string hfEp = hf_endpoint();
+#ifdef _WIN32
 	if (!hfEp.empty()) _putenv(("HF_ENDPOINT=" + hfEp).c_str());
+#else
+	if (!hfEp.empty()) setenv("HF_ENDPOINT", hfEp.c_str(), 1);
+#endif
 
-	printf("  启动 llama-server（首次下载+加载模型，可能需几分钟）...\n");
+	printf(tr("  启动 llama-server（首次下载+加载模型，可能需几分钟）...\n",
+	          "  Starting llama-server (first run downloads + loads the model; may take minutes)...\n"));
 	ensure_data_dir();
 	string logf = data_dir() + "/server.log";
+#ifdef _WIN32
 	string cmd = "start \"memo-embd\" /B \"" + llama_server_path() + "\""
 		+ " --embedding"
 		+ " --host 127.0.0.1 --port " + to_string(server_port())
 		+ " -hf \"" + embed_hf_repo() + "\""
 		+ " --hf-file \"" + embed_hf_file() + "\""
 		+ " > nul 2> \"" + logf + "\"";
+#else
+	string cmd = "(\"" + llama_server_path() + "\""
+		+ " --embedding"
+		+ " --host 127.0.0.1 --port " + to_string(server_port())
+		+ " -hf \"" + embed_hf_repo() + "\""
+		+ " --hf-file \"" + embed_hf_file() + "\""
+		+ " > /dev/null 2> \"" + logf + "\" &) ";
+#endif
 	system(cmd.c_str());
 
 	for (int i = 0; i < 600; i++) // 最多等 300 秒（首次模型下载 + 加载）
 	{
+#ifdef _WIN32
 		Sleep(500);
-		if (server_health()) { printf("  llama-server 就绪。\n"); return true; }
+#else
+		usleep(500 * 1000);
+#endif
+		if (server_health()) { printf(tr("  llama-server 就绪。\n", "  llama-server ready.\n")); return true; }
 	}
 	// 超时：dump server.log 末尾帮助诊断
-	g_last_err = "llama-server 启动超时（首次下载模型较久，请重试）。server.log 末尾：\n";
+	g_last_err = tr("llama-server 启动超时（首次下载模型较久，请重试）。server.log 末尾：\n",
+	                 "llama-server startup timed out (first model download is slow; retry). server.log tail:\n");
 	ifstream lf(logf, ios::binary);
 	if (lf)
 	{
@@ -632,7 +682,11 @@ static bool ensure_server()
 // 程序退出时清理 server
 static void kill_server()
 {
+#ifdef _WIN32
 	system("taskkill /IM llama-server.exe /F >nul 2>nul");
+#else
+	system("pkill -x llama-server >/dev/null 2>&1");
+#endif
 }
 
 // embeddinggemma 是非对称检索模型，文档/查询需各自前缀（model card 要求）
@@ -651,13 +705,13 @@ static vector<float> embed_text(const string& text)
 	g_last_err.clear();
 	if (!ensure_server())
 	{
-		if (g_last_err.empty()) g_last_err = "llama-server 不可用";
+		if (g_last_err.empty()) g_last_err = tr("llama-server 不可用", "llama-server unavailable");
 		return {};
 	}
 
 	string body = "{\"input\":" + json_escape(text) + "}";
 	string resp = http_post_json("http://127.0.0.1:" + to_string(server_port()) + "/v1/embeddings", body);
-	if (resp.empty()) { g_last_err = "embedding 请求无响应"; return {}; }
+	if (resp.empty()) { g_last_err = tr("embedding 请求无响应", "embedding request got no response"); return {}; }
 
 	// 解析 OpenAI 兼容 JSON（兼容 data[0].embedding 和顶层 embedding）
 	Json j = json_parse(resp);
@@ -668,13 +722,13 @@ static vector<float> embed_text(const string& text)
 	if (!emb) emb = j.find("embedding");
 	if (!emb || emb->t != Json::Arr)
 	{
-		g_last_err = "响应缺少 embedding 数组（原始: " + resp.substr(0, 200) + ")";
+		g_last_err = string(tr("响应缺少 embedding 数组（原始: ", "response missing embedding array (raw: ")) + resp.substr(0, 200) + ")";
 		return {};
 	}
 	vector<float> v;
 	v.reserve(emb->arr.size());
 	for (auto& x : emb->arr) if (x.t == Json::Num) v.push_back((float)x.num);
-	if (v.empty()) g_last_err = "embedding 数组为空";
+	if (v.empty()) g_last_err = tr("embedding 数组为空", "embedding array is empty");
 	return v;
 }
 
@@ -916,7 +970,7 @@ static ll g_last_active_id = 0; // 上一个活跃的备忘录（add/edit/search
 
 static int cmd_add(vector<string>& args)
 {
-	if (args.empty()) { printf("用法: add <标题> [正文...]\n"); return 1; }
+	if (args.empty()) { printf(tr("用法: add <标题> [正文...]\n", "Usage: add <title> [body...]\n")); return 1; }
 	string title = args[0];
 	string body;
 	for (size_t i = 1; i < args.size(); i++)
@@ -926,7 +980,8 @@ static int cmd_add(vector<string>& args)
 	}
 	if (body.empty() && g_repl)
 	{
-		printf("请输入正文（单独一行输入 :end 或 end 结束；或按 Ctrl+Z 回车结束）：\n");
+		printf(tr("请输入正文（单独一行输入 :end 或 end 结束；或按 Ctrl+Z 回车结束）：\n",
+		          "Enter body (finish with a lone :end or end line; or Ctrl+Z then Enter):\n"));
 		string line;
 		while (getline(cin, line))
 		{
@@ -962,14 +1017,16 @@ static int cmd_add(vector<string>& args)
 	{
 		m.vec_ok = true;
 		vs[id] = set;
-		printf("已新增 #%-4lld（向量已生成，%d 段，dim=%zu）\n", id, ok_cnt, set[0].size());
+		printf(tr("已新增 #%-4lld（向量已生成，%d 段，dim=%zu）\n",
+		          "Added #%-4lld (vectors ok, %d paras, dim=%zu)\n"), id, ok_cnt, set[0].size());
 	}
 	else
 	{
 		m.vec_ok = false;
-		printf("已新增 #%-4lld（警告：embedding 失败 %d 段，标记 pending）\n", id, fail_cnt);
-		if (!g_last_err.empty()) printf("  原因：%s\n", g_last_err.c_str());
-		printf("  解决后运行 reindex 补算。\n");
+		printf(tr("已新增 #%-4lld（警告：embedding 失败 %d 段，标记 pending）\n",
+		          "Added #%-4lld (warning: embedding failed for %d paras, marked pending)\n"), id, fail_cnt);
+		if (!g_last_err.empty()) printf(tr("  原因：%s\n", "  reason: %s\n"), g_last_err.c_str());
+		printf(tr("  解决后运行 reindex 补算。\n", "  Run reindex once fixed.\n"));
 	}
 	ms.push_back(m);
 	save_memos(ms);
@@ -980,31 +1037,195 @@ static int cmd_add(vector<string>& args)
 static int cmd_list(vector<string>&)
 {
 	auto ms = load_memos();
-	if (ms.empty()) { printf("（空，还没有备忘录）\n"); return 0; }
-	printf("共 %zu 条：\n", ms.size());
+	if (ms.empty()) { printf(tr("（空，还没有备忘录）\n", "(empty, no memos yet)\n")); return 0; }
+	printf(tr("共 %zu 条：\n", "%zu memo(s):\n"), ms.size());
 	for (auto& m : ms)
 	{
 		printf("#%-4lld [%s] %s", m.id, m.ctime.c_str(), m.title.c_str());
-		if (!m.vec_ok) printf("  (无向量)");
+		if (!m.vec_ok) printf(tr("  (无向量)", "  (no vectors)"));
 		printf("\n");
 	}
 	return 0;
 }
 
+// ===================== show：Markdown 渲染 + 分页 =====================
+// 终端是否支持 ANSI 转义（Windows 需在 main 里开启 VT；重定向/老终端则关闭渲染色）
+static bool g_ansi_ok =
+#ifdef _WIN32
+	false;
+#else
+	true;
+#endif
+
+static const char* A(const char* code) { return g_ansi_ok ? code : ""; }
+static const char* A_RESET() { return A("\x1b[0m"); }
+
+// 行内标记：`code`、**粗体**、*斜体*、_斜体_、__粗体__（未闭合的标记原样输出）
+static string md_inline(const string& s)
+{
+	string out;
+	size_t i = 0;
+	while (i < s.size())
+	{
+		char c = s[i];
+		if (c == '`')
+		{
+			size_t j = s.find('`', i + 1);
+			if (j != string::npos)
+			{
+				out += A("\x1b[7m") + s.substr(i + 1, j - i - 1) + A_RESET();
+				i = j + 1;
+				continue;
+			}
+		}
+		else if (c == '*' || c == '_')
+		{
+			bool dbl = (i + 1 < s.size() && s[i + 1] == c);
+			string seq = dbl ? string(2, c) : string(1, c);
+			size_t j = s.find(seq, i + seq.size());
+			if (j != string::npos)
+			{
+				// **粗**；单符号但内容两侧紧贴空格的（如 a * b）按字面处理
+				out += A(dbl ? "\x1b[1m" : "\x1b[3m") + s.substr(i + seq.size(), j - i - seq.size()) + A_RESET();
+				i = j + seq.size();
+				continue;
+			}
+		}
+		out += c;
+		i++;
+	}
+	return out;
+}
+
+// 渲染一段多行文本（保留 fence 状态以跨段渲染 ``` 代码块）
+static void md_print_text(const string& text, bool& in_fence)
+{
+	for (auto& ln : split_lines(text))
+	{
+		if (!in_fence && (ln.rfind("```", 0) == 0 || ln.rfind("~~~", 0) == 0))
+		{
+			in_fence = true;
+			printf("%s%s%s\n", A("\x1b[36m"), ln.c_str(), A_RESET());
+			continue;
+		}
+		if (in_fence)
+		{
+			if (ln.rfind("```", 0) == 0 || ln.rfind("~~~", 0) == 0)
+			{
+				in_fence = false;
+				printf("%s%s%s\n", A("\x1b[36m"), ln.c_str(), A_RESET());
+			}
+			else printf("%s%s%s\n", A("\x1b[36m"), ln.c_str(), A_RESET());
+			continue;
+		}
+		// 标题 # ~ ######
+		if (ln.size() > 1 && ln[0] == '#')
+		{
+			size_t h = 0;
+			while (h < ln.size() && ln[h] == '#') h++;
+			if (h <= 6 && h < ln.size() && (ln[h] == ' ' || ln[h] == '\t'))
+			{
+				const char* col = h == 1 ? "\x1b[1;96m" : h == 2 ? "\x1b[1;95m" : "\x1b[1;94m";
+				printf("%s%s%s\n", A(col), md_inline(ln).c_str(), A_RESET());
+				continue;
+			}
+		}
+		// 分隔线
+		if (ln.size() >= 3 && (ln.find_first_not_of('-') == string::npos || ln.find_first_not_of('*') == string::npos || ln.find_first_not_of('_') == string::npos))
+		{
+			printf("%s%s%s\n", A("\x1b[2m"), ln.c_str(), A_RESET());
+			continue;
+		}
+		// 引用 >
+		if (ln.size() >= 1 && ln[0] == '>')
+		{
+			printf("%s%s%s%s\n", A("\x1b[2;3m"), "> ", A_RESET(), md_inline(ln.size() > 1 && ln[1] == ' ' ? ln.substr(2) : ln.substr(1)).c_str());
+			continue;
+		}
+		// 列表（- * + 与 1. 数字）
+		{
+			size_t k = 0;
+			while (k < ln.size() && (ln[k] == ' ' || ln[k] == '\t')) k++;
+			bool bullet = k < ln.size() && (ln[k] == '-' || ln[k] == '*' || ln[k] == '+') && k + 1 < ln.size() && ln[k + 1] == ' ';
+			bool number = false;
+			size_t d = k;
+			while (d < ln.size() && ln[d] >= '0' && ln[d] <= '9') d++;
+			if (!bullet && d > k && d + 1 < ln.size() && ln[d] == '.' && ln[d + 1] == ' ') number = true;
+			if (bullet || number)
+			{
+				size_t mark_end = bullet ? k + 2 : d + 2;
+				printf("%.*s%s%.*s%s%s\n", (int)k, ln.c_str(),
+				       A("\x1b[1;33m"), (int)(mark_end - k), ln.c_str() + k, A_RESET(),
+				       md_inline(ln.substr(mark_end)).c_str());
+				continue;
+			}
+		}
+		printf("%s\n", md_inline(ln).c_str());
+	}
+}
+
+// 解析 --limit / --from 的值：<n>L 行 / <n>P 段（后缀可省略，默认 L）
+static bool parse_unit_val(const string& v, ll& n, char& unit)
+{
+	if (v.empty()) return false;
+	unit = 'L';
+	string num = v;
+	char back = v[v.size() - 1];
+	if (back == 'L' || back == 'l' || back == 'P' || back == 'p')
+	{
+		unit = (back == 'P' || back == 'p') ? 'P' : 'L';
+		num = v.substr(0, v.size() - 1);
+	}
+	if (num.empty() || num.find_first_not_of("0123456789") != string::npos) return false;
+	n = atoll(num.c_str());
+	return true;
+}
+
 static int cmd_show(vector<string>& args)
 {
-	bool follow = false;
-	bool has_id = false;
+	bool follow = false, md = false, all = false, has_id = false;
 	ll id = 0;
-	for (auto& a : args)
+	ll limit_n = -1, from_n = 1;
+	char limit_unit = 'L', from_unit = 'L';
+	for (size_t i = 0; i < args.size(); i++)
 	{
+		const string& a = args[i];
 		if (a == "-f" || a == "--follow") follow = true;
+		else if (a == "-m" || a == "--markdown") md = true;
+		else if (a == "--all") all = true;
+		else if (a.rfind("--limit", 0) == 0)
+		{
+			string v = a.size() > 7 ? a.substr(7) : "";
+			if (!v.empty() && v[0] == '=') v = v.substr(1);
+			else if (v.empty() && i + 1 < args.size()) v = args[++i];
+			if (!parse_unit_val(v, limit_n, limit_unit))
+			{
+				printf(tr("用法: --limit=<n>L 或 <n>P（如 --limit=20L、--limit=3P）\n", "Usage: --limit=<n>L or <n>P (e.g. --limit=20L, --limit=3P)\n"));
+				return 1;
+			}
+		}
+		else if (a.rfind("--from", 0) == 0)
+		{
+			string v = a.size() > 6 ? a.substr(6) : "";
+			if (!v.empty() && v[0] == '=') v = v.substr(1);
+			else if (v.empty() && i + 1 < args.size()) v = args[++i];
+			if (!parse_unit_val(v, from_n, from_unit))
+			{
+				printf(tr("用法: --from=<n>L 或 <n>P（如 --from=5L，从第 5 行开始）\n", "Usage: --from=<n>L or <n>P (e.g. --from=5L, start at line 5)\n"));
+				return 1;
+			}
+		}
 		else { id = atoll(a.c_str()); has_id = true; }
 	}
-	if (!has_id && !follow) { printf("用法: show <id> [-f|--follow]\n"); return 1; }
+	if (!has_id && !follow)
+	{
+		printf(tr("用法: show <id> [-f] [-m] [--limit=nL|nP] [--from=nL|nP] [--all]\n",
+		          "Usage: show <id> [-f] [-m] [--limit=nL|nP] [--from=nL|nP] [--all]\n"));
+		return 1;
+	}
 	if (follow && !has_id)
 	{
-		if (g_last_active_id == 0) { printf("（还没有活跃备忘录：先 add / edit / search / find）\n"); return 0; }
+		if (g_last_active_id == 0) { printf(tr("（还没有活跃备忘录：先 add / edit / search / find）\n", "(no active memo yet: try add / edit / search / find first)\n")); return 0; }
 		id = g_last_active_id;
 	}
 
@@ -1013,11 +1234,66 @@ static int cmd_show(vector<string>& args)
 	{
 		g_last_active_id = id;
 		printf("#%lld  %s\n", m.id, m.title.c_str());
-		printf("  时间: %s   向量: %s\n", m.ctime.c_str(), m.vec_ok ? "已生成" : "缺失");
-		printf("  正文:\n%s\n", m.body.c_str());
+		printf(tr("  时间: %s   向量: %s\n", "  time: %s   vectors: %s\n"), m.ctime.c_str(), m.vec_ok ? tr("已生成", "ok") : tr("缺失", "missing"));
+
+		// ---- 分页：单位（行 L / 段 P），显式 --limit/--from 优先于自动截断 ----
+		char unit = (limit_n >= 0) ? limit_unit : from_unit;
+		bool explicit_range = (limit_n >= 0 || from_n > 1);
+		vector<string> units;
+		if (unit == 'P') units = split_paragraphs(m.body);
+		else units = split_lines(m.body);
+		ll total = (ll)units.size();
+
+		ll begin = (from_n > 1) ? from_n : 1;
+		ll end = total;
+		if (limit_n >= 0) end = begin + limit_n - 1;
+
+		// 未显式指定范围：默认最多显示一部分；--all 显示全部（但仍设硬上限，尽可能多显示）
+		const ll DEF_MAX_UNITS = 50, DEF_MAX_BYTES = 4000;
+		const ll ALL_MAX_UNITS = 500, ALL_MAX_BYTES = 50000;
+		if (!explicit_range)
+		{
+			ll maxU = all ? ALL_MAX_UNITS : DEF_MAX_UNITS;
+			ll maxB = all ? ALL_MAX_BYTES : DEF_MAX_BYTES;
+			ll bytes = 0;
+			end = begin - 1;
+			for (ll k = begin; k <= total; k++)
+			{
+				bytes += (ll)units[k - 1].size() + 1;
+				end = k;
+				if (end - begin + 1 >= maxU || bytes >= maxB) break;
+			}
+		}
+		if (end > total) end = total;
+
+		const char* un = (unit == 'P') ? tr("段", "para(s)") : tr("行", "line(s)");
+		ll shown = end - begin + 1;
+		printf(tr("  正文（共 %lld %s）:\n", "  body (%lld %s total):\n"), total, un);
+		if (shown <= 0)
+		{
+			printf(tr("  （第 %lld %s超出范围，没有可显示的内容）\n", "  (unit %lld is out of range; nothing to show)\n"), begin, un);
+			return 0;
+		}
+		if (begin > 1)
+			printf("%s%s%s\n", A("\x1b[2m"),
+			       (string(tr("  ……（前面还有 ", "  ... (") + to_string(begin - 1) + " " + un + tr("未显示）", " before, omitted)"))).c_str(), A_RESET());
+
+		bool in_fence = false;
+		for (ll k = begin; k <= end; k++)
+		{
+			if (k > begin) printf(unit == 'P' ? "\n" : "");
+			if (md) md_print_text(units[k - 1], in_fence);
+			else printf("%s\n", units[k - 1].c_str());
+		}
+		if (end < total)
+		{
+			string hint = explicit_range ? "" : tr("；--all 显示全部", "; use --all to show everything");
+			printf("%s%s%s\n", A("\x1b[2m"),
+			       (string(tr("  ……（后面还有 ", "  ... (") + to_string(total - end) + " " + un + tr("未显示", " after, omitted")) + hint + tr("）", ")")).c_str(), A_RESET());
+		}
 		return 0;
 	}
-	printf("找不到 #%lld\n", id);
+	printf(tr("找不到 #%lld\n", "memo #%lld not found\n"), id);
 	return 1;
 }
 
@@ -1032,7 +1308,7 @@ static int cmd_search(vector<string>& args)
 		else if (a == "-l" || a == "--list") list_only = true;
 		else kws.push_back(a);
 	}
-	if (kws.empty()) { printf("用法: search <关键词...> [--any] [-l|--list]\n"); return 1; }
+	if (kws.empty()) { printf(tr("用法: search <关键词...> [--any] [-l|--list]\n", "Usage: search <keywords...> [--any] [-l|--list]\n")); return 1; }
 
 	vector<string> kws_l;
 	for (auto& k : kws) kws_l.push_back(lower(k));
@@ -1054,10 +1330,10 @@ static int cmd_search(vector<string>& args)
 		bool ok = any ? (matched >= 1) : (matched == kws_l.size());
 		if (ok) hits.push_back(&m);
 	}
-	if (hits.empty()) { printf("未匹配任何备忘录。\n"); return 0; }
+	if (hits.empty()) { printf(tr("未匹配任何备忘录。\n", "No memos matched.\n")); return 0; }
 	g_last_active_id = hits[0]->id; // search 首个匹配即为上一个活跃备忘录
 
-	printf("命中 %zu 条（%s）：\n", hits.size(), any ? "OR" : "AND");
+	printf(tr("命中 %zu 条（%s）：\n", "%zu hit(s) (%s):\n"), hits.size(), any ? "OR" : "AND");
 	for (auto* m : hits)
 	{
 		if (list_only)
@@ -1116,7 +1392,7 @@ static int cmd_find(vector<string>& args)
 		else if (a.rfind("-n", 0) == 0 && a.size() > 2) n = atoi(a.c_str() + 2);
 		else if (a != "-n") parts.push_back(a);
 	}
-	if (parts.empty()) { printf("用法: find <语义查询> [-nK] [-l|--list]\n"); return 1; }
+	if (parts.empty()) { printf(tr("用法: find <语义查询> [-nK] [-l|--list]\n", "Usage: find <semantic query> [-nK] [-l|--list]\n")); return 1; }
 
 	string q;
 	for (size_t i = 0; i < parts.size(); i++) { if (i) q += " "; q += parts[i]; }
@@ -1124,7 +1400,7 @@ static int cmd_find(vector<string>& args)
 	auto qv = embed_text(query_prompt(q));
 	if (qv.empty())
 	{
-		printf("无法向量化查询，语义搜索中止。\n  原因：%s\n", g_last_err.c_str());
+		printf(tr("无法向量化查询，语义搜索中止。\n  原因：%s\n", "Failed to embed the query; semantic search aborted.\n  reason: %s\n"), g_last_err.c_str());
 		return 1;
 	}
 
@@ -1142,14 +1418,15 @@ static int cmd_find(vector<string>& args)
 	}
 	if (ranked.empty())
 	{
-		printf("没有可语义搜索的备忘录（可能都 pending）。运行 reindex 补算。\n");
+		printf(tr("没有可语义搜索的备忘录（可能都 pending）。运行 reindex 补算。\n",
+		          "No memos with vectors (all pending?). Run reindex to compute them.\n"));
 		return 0;
 	}
 	sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.score > b.score; });
 	g_last_active_id = ranked[0].m->id; // find 第一匹配即为上一个活跃备忘录
 
 	int shown = min((int)ranked.size(), n > 0 ? n : 5);
-	printf("Top-%d 语义匹配：\n", shown);
+	printf(tr("Top-%d 语义匹配：\n", "Top-%d semantic matches:\n"), shown);
 	if (list_only)
 	{
 		// 只列标题（去重：每条备忘录按最高段落分只出现一次）
@@ -1171,7 +1448,7 @@ static int cmd_find(vector<string>& args)
 			auto paras = split_paragraphs(h.m->body);
 			string ptext = (h.para >= 0 && h.para < (int)paras.size()) ? paras[h.para] : "";
 			string preview = truncate_utf8_chars(ptext, 18);
-			if (preview.empty()) preview = "(仅标题)";
+			if (preview.empty()) preview = tr("(仅标题)", "(title only)");
 			printf("  %5.1f%%  #%-4lld %s  ── %s\n", h.score * 100.0, h.m->id, h.m->title.c_str(), preview.c_str());
 		}
 	}
@@ -1180,7 +1457,7 @@ static int cmd_find(vector<string>& args)
 
 static int cmd_delete(vector<string>& args)
 {
-	if (args.empty()) { printf("用法: delete <id>\n"); return 1; }
+	if (args.empty()) { printf(tr("用法: delete <id>\n", "Usage: delete <id>\n")); return 1; }
 	ll id = atoll(args[0].c_str());
 	auto ms = load_memos();
 	bool found = false;
@@ -1191,22 +1468,62 @@ static int cmd_delete(vector<string>& args)
 		if (m.id == id) found = true;
 		else ns.push_back(m);
 	}
-	if (!found) { printf("找不到 #%lld\n", id); return 1; }
+	if (!found) { printf(tr("找不到 #%lld\n", "memo #%lld not found\n"), id); return 1; }
 	save_memos(ns);
 
 	auto vs = load_vectors();
 	vs.erase(id);
 	save_vectors(vs);
-	printf("已删除 #%lld\n", id);
+	printf(tr("已删除 #%lld\n", "Deleted #%lld\n"), id);
 	return 0;
 }
 
-// 编辑器命令：config.editor / $EDITOR > $VISUAL > ""（空表示用 notepad）
+// 编辑器命令：config.editor / $EDITOR > $VISUAL > 平台默认（Win: edit→notepad；Unix: nano→vi）
+// 在 PATH 中查找可执行文件
+static bool exe_on_path(const string& name)
+{
+#ifdef _WIN32
+	const char sep = ';';
+	const string exe = name + ".exe";
+#else
+	const char sep = ':';
+	const string exe = name;
+#endif
+	const char* pe = getenv("PATH");
+	if (!pe) return false;
+	string dirs(pe);
+	size_t pos = 0;
+	while (pos <= dirs.size())
+	{
+		size_t end = dirs.find(sep, pos);
+		string dir = dirs.substr(pos, (end == string::npos ? dirs.size() : end) - pos);
+		error_code ec;
+		if (!dir.empty() && filesystem::exists(dir + "/" + exe, ec)) return true;
+		if (end == string::npos) break;
+		pos = end + 1;
+	}
+	return false;
+}
+
+static string default_editor()
+{
+#ifdef _WIN32
+	// 新版 edit.exe（2025+ Win11 随更新推送）是阻塞式控制台编辑器，体验更好；老系统无则退回 notepad
+	if (exe_on_path("edit")) return "edit";
+	return "notepad";
+#else
+	if (exe_on_path("nano")) return "nano";
+	return "vi";
+#endif
+}
+
 static string resolve_editor()
 {
 	string v = get_effective("editor", "EDITOR", "");
 	if (!v.empty()) return v;
-	return get_env("VISUAL", "");
+	v = get_env("VISUAL", "");
+	if (!v.empty()) return v;
+	return default_editor();
 }
 
 static void write_edit_file(const string& path, const string& title, const string& body)
@@ -1244,7 +1561,7 @@ static bool parse_edit_file(const string& path, string& title, string& body)
 
 static int cmd_edit(vector<string>& args)
 {
-	if (args.empty()) { printf("用法: edit <id>\n"); return 1; }
+	if (args.empty()) { printf(tr("用法: edit <id>\n", "Usage: edit <id>\n")); return 1; }
 	ll id = atoll(args[0].c_str());
 	auto ms = load_memos();
 	for (auto& m : ms) if (m.id == id)
@@ -1252,25 +1569,24 @@ static int cmd_edit(vector<string>& args)
 		g_last_active_id = id; // 被编辑即为上一个活跃备忘录
 		ensure_data_dir();
 		string tmp = data_dir() + "/.edit-" + to_string(id) + ".txt";
-		string editor = resolve_editor();
+		string editor = resolve_editor(); // 已含平台默认，永不为空
 
 		for (;;)
 		{
 			write_edit_file(tmp, m.title, m.body);   // 每次重试重置为当前内容
 
-			string cmd = editor.empty()
-				? ("notepad \"" + tmp + "\"")
-				: (editor + " \"" + tmp + "\"");      // 允许 $EDITOR 带参数
+			string cmd = editor + " \"" + tmp + "\""; // 允许 $EDITOR 带参数
 			int rc = system(cmd.c_str());
-			if (rc != 0 && !editor.empty())
+			if (rc != 0 && editor != default_editor())
 			{
-				printf("  启动 %s 失败，回退到 notepad。\n", editor.c_str());
-				editor = "";
-				rc = system(("notepad \"" + tmp + "\"").c_str());
+				printf(tr("  启动 %s 失败，回退到 %s。\n", "  Failed to launch %s; falling back to %s.\n"), editor.c_str(), default_editor().c_str());
+				editor = default_editor();
+				rc = system((editor + " \"" + tmp + "\"").c_str());
 			}
 
 			// 统一等待：不依赖编辑器是否阻塞
-			printf("  编辑完成、保存并关闭编辑器后，请按回车继续……\n");
+			printf(tr("  编辑完成、保存并关闭编辑器后，请按回车继续……\n",
+			          "  After saving and closing the editor, press Enter to continue...\n"));
 			fflush(stdout);
 			string dummy;
 			getline(cin, dummy);
@@ -1280,7 +1596,7 @@ static int cmd_edit(vector<string>& args)
 			if (ok && !nt.empty())
 			{
 				filesystem::remove(tmp);
-				if (nt == m.title && nb == m.body) { printf("#%lld 未改动。\n", id); return 0; }
+				if (nt == m.title && nb == m.body) { printf(tr("#%lld 未改动。\n", "#%lld unchanged.\n"), id); return 0; }
 				m.title = nt;
 				m.body = nb;
 
@@ -1301,25 +1617,26 @@ static int cmd_edit(vector<string>& args)
 					vs[id] = set;
 					save_memos(ms);
 					save_vectors(vs);
-					printf("已编辑 #%lld 并重算向量（%d 段）。\n", id, ok_cnt);
+					printf(tr("已编辑 #%lld 并重算向量（%d 段）。\n", "Edited #%lld and recomputed vectors (%d paras).\n"), id, ok_cnt);
 				}
 				else
 				{
 					m.vec_ok = false;
 					save_memos(ms);
 					save_vectors(vs);
-					printf("已编辑 #%lld（embedding 失败 %d 段，标记 pending", id, fail_cnt);
-					if (!g_last_err.empty()) printf("：%s", g_last_err.c_str());
-					printf("）\n");
+					printf(tr("已编辑 #%lld（embedding 失败 %d 段，标记 pending", "Edited #%lld (embedding failed for %d paras, marked pending"), id, fail_cnt);
+					if (!g_last_err.empty()) printf(tr("：%s", ": %s"), g_last_err.c_str());
+				printf(tr("）\n", ")\n"));
 				}
 				return 0;
 			}
 			// 格式非法：报错，重置并重试
-			printf("  编辑结果无效（%s），已恢复原内容并重新打开编辑器。\n",
-				ok ? "标题为空" : "缺少 ==== 分隔行");
+			printf(tr("  编辑结果无效（%s），已恢复原内容并重新打开编辑器。\n",
+			          "  Invalid edit result (%s); restored the original and reopened the editor.\n"),
+				ok ? tr("标题为空", "empty title") : tr("缺少 ==== 分隔行", "missing ==== separator line"));
 		}
 	}
-	printf("找不到 #%lld\n", id);
+	printf(tr("找不到 #%lld\n", "memo #%lld not found\n"), id);
 	return 1;
 }
 
@@ -1346,17 +1663,26 @@ static int cmd_reindex(vector<string>& args)
 		{
 			auto v = embed_text(doc_prompt(m.title, p));
 			if (!v.empty()) { set.push_back(v); total_para++; }
-			else { done = false; printf("  #%lld 失败：%s\n", m.id, g_last_err.c_str()); }
+			else { done = false; printf(tr("  #%lld 失败：%s\n", "  #%lld failed: %s\n"), m.id, g_last_err.c_str()); }
 		}
 		if (done && !set.empty()) { vs[m.id] = set; m.vec_ok = true; ok++; }
 		else m.vec_ok = false;
 	}
 	save_memos(ms);
 	save_vectors(vs);
-	if (force_all) printf("检测到旧向量格式 v%d，已按全量重建。\n", dv);
-	if (cnt == 0) printf("没有需要补算的（全部已有向量）。加 --all 可全量重建。\n");
-	else printf("补算完成：%d/%d 条成功（共 %d 段）。\n", ok, cnt, total_para);
+	if (force_all) printf(tr("检测到旧向量格式 v%d，已按全量重建。\n", "Old vector format v%d detected; rebuilt fully.\n"), dv);
+	if (cnt == 0) printf(tr("没有需要补算的（全部已有向量）。加 --all 可全量重建。\n", "Nothing pending (all vectors ok). Add --all to rebuild.\n"));
+	else printf(tr("补算完成：%d/%d 条成功（共 %d 段）。\n", "Reindex done: %d/%d ok (%d paras total).\n"), ok, cnt, total_para);
 	return 0;
+}
+
+// 来源标签（cmd_config 展示用）
+static const char* cfg_src_label(bool ignored, bool has_env, bool has_cfg)
+{
+	if (ignored) return tr("config(优先)", "config(priority)");
+	if (has_env) return tr("环境变量", "env var");
+	if (has_cfg) return tr("config", "config");
+	return tr("默认", "default");
 }
 
 static int cmd_config(vector<string>& args)
@@ -1371,11 +1697,11 @@ static int cmd_config(vector<string>& args)
 		string cfg = (m.find(it.key) != m.end()) ? m[it.key] : "";
 		bool ignored = cfg_ignores_env(m, it.key);
 		string eff = get_effective(it.key, it.env, it.def());
-		string src = ignored ? "config(优先)" : (!env.empty() ? "环境变量" : (!cfg.empty() ? "config" : "默认"));
-		printf("  %-16s %s\n", it.key, it.desc);
-		printf("      环境变量 %-16s =[%s]\n", it.env, env.c_str());
-		printf("      config  %-16s =[%s]%s\n", it.key, cfg.c_str(), ignored ? "  (优先于环境变量)" : "");
-		printf("      默认 =[%s]   生效=[%s]  来源:%s\n", it.def().c_str(), eff.c_str(), src.c_str());
+		string src = cfg_src_label(ignored, !env.empty(), !cfg.empty());
+		printf("  %-16s %s\n", it.key, tr(it.desc, it.desc_en));
+		printf(tr("      环境变量 %-16s =[%s]\n", "      env var  %-16s =[%s]\n"), it.env, env.c_str());
+		printf(tr("      config  %-16s =[%s]%s\n", "      config  %-16s =[%s]%s\n"), it.key, cfg.c_str(), ignored ? tr("  (优先于环境变量)", "  (priority over env)") : "");
+		printf(tr("      默认 =[%s]   生效=[%s]  来源:%s\n", "      default=[%s]   effective=[%s]  source:%s\n"), it.def().c_str(), eff.c_str(), src.c_str());
 	};
 
 	// config get [key]
@@ -1383,13 +1709,19 @@ static int cmd_config(vector<string>& args)
 	{
 		if (args.size() == 1)
 		{
-			printf("当前配置（配置文件 %s）：\n", config_file().c_str());
+			printf(tr("当前配置（配置文件 %s）：\n", "Current config (file %s):\n"), config_file().c_str());
 			for (auto& it : g_cfg_items) { show_one(it); printf("\n"); }
 		}
 		else
 		{
 			const CfgItem* p = cfg_find(args[1]);
-			if (!p) { printf("未知配置项：%s（可用：", args[1].c_str()); for (auto& it : g_cfg_items) printf("%s ", it.key); printf("）\n"); return 1; }
+			if (!p)
+			{
+				printf(tr("未知配置项：%s（可用：", "Unknown config key: %s (available: "), args[1].c_str());
+				for (auto& it : g_cfg_items) printf("%s ", it.key);
+				printf(tr("）\n", ")\n"));
+				return 1;
+			}
 			show_one(*p);
 		}
 		return 0;
@@ -1398,9 +1730,15 @@ static int cmd_config(vector<string>& args)
 	// config set <key> <value>
 	if (!args.empty() && args[0] == "set")
 	{
-		if (args.size() < 3) { printf("用法: config set <key> <value>\n"); return 1; }
+		if (args.size() < 3) { printf(tr("用法: config set <key> <value>\n", "Usage: config set <key> <value>\n")); return 1; }
 		const CfgItem* p = cfg_find(args[1]);
-		if (!p) { printf("未知配置项：%s（可用：", args[1].c_str()); for (auto& it : g_cfg_items) printf("%s ", it.key); printf("）\n"); return 1; }
+		if (!p)
+		{
+			printf(tr("未知配置项：%s（可用：", "Unknown config key: %s (available: "), args[1].c_str());
+			for (auto& it : g_cfg_items) printf("%s ", it.key);
+			printf(tr("）\n", ")\n"));
+			return 1;
+		}
 		string value = args[2];
 		for (size_t i = 3; i < args.size(); i++) { value += " "; value += args[i]; }
 		auto m = load_config_map();
@@ -1408,29 +1746,31 @@ static int cmd_config(vector<string>& args)
 		if (!env_of(*p).empty())
 		{
 			cfg_set_ignore_env(m, p->key, true);
-			printf("注意：环境变量 %s 仍存在，已标记 %s 优先于环境变量。\n", p->env, p->key);
+			printf(tr("注意：环境变量 %s 仍存在，已标记 %s 优先于环境变量。\n",
+			          "Note: env %s is still set; marked %s to take priority over it.\n"), p->env, p->key);
 		}
 		save_config_map(m);
-		printf("已设置 %s = %s\n", p->key, value.c_str());
+		printf(tr("已设置 %s = %s\n", "Set %s = %s\n"), p->key, value.c_str());
 		return 0;
 	}
 
 	// config unset <key>
 	if (!args.empty() && args[0] == "unset")
 	{
-		if (args.size() < 2) { printf("用法: config unset <key>\n"); return 1; }
+		if (args.size() < 2) { printf(tr("用法: config unset <key>\n", "Usage: config unset <key>\n")); return 1; }
 		const CfgItem* p = cfg_find(args[1]);
-		if (!p) { printf("未知配置项：%s\n", args[1].c_str()); return 1; }
+		if (!p) { printf(tr("未知配置项：%s\n", "Unknown config key: %s\n"), args[1].c_str()); return 1; }
 		auto m = load_config_map();
 		m.erase(p->key);
 		cfg_set_ignore_env(m, p->key, false);
 		save_config_map(m);
-		printf("已移除 %s（回归环境变量/默认）。\n", p->key);
+		printf(tr("已移除 %s（回归环境变量/默认）。\n", "Removed %s (falls back to env/default).\n"), p->key);
 		return 0;
 	}
 
 	// 引导式（无参）：逐项显示，回车保持 / 输入新值 / 输入 - 恢复默认
-	printf("配置（回车=保持，输入新值=修改，输入 -=恢复默认；文件 %s）：\n\n", config_file().c_str());
+	printf(tr("配置（回车=保持，输入新值=修改，输入 -=恢复默认；文件 %s）：\n\n",
+	          "Config (Enter=keep, new value=change, '-'=reset to default; file %s):\n\n"), config_file().c_str());
 	auto m = load_config_map();
 	for (auto& it : g_cfg_items)
 	{
@@ -1441,12 +1781,12 @@ static int cmd_config(vector<string>& args)
 		// 冲突：环境变量与 config 同时存在且未标记 → 立即提示二选一
 		if (!env.empty() && !cfg.empty() && !ignored)
 		{
-			printf("⚠ 冲突：%s（%s）\n", it.key, it.desc);
-			printf("    环境变量 %s = [%s]\n", it.env, env.c_str());
-			printf("    config  %s = [%s]\n", it.key, cfg.c_str());
-			printf("    [1] 生效 config（标记 %s 环境变量优先级下降）\n", it.key);
-			printf("    [2] 生效环境变量（删除 config 里的 %s）\n", it.key);
-			printf("  请选择 [1/2]（默认 1）：");
+			printf(tr("⚠ 冲突：%s（%s）\n", "⚠ Conflict: %s (%s)\n"), it.key, tr(it.desc, it.desc_en));
+			printf(tr("    环境变量 %s = [%s]\n", "    env var  %s = [%s]\n"), it.env, env.c_str());
+			printf(tr("    config  %s = [%s]\n", "    config  %s = [%s]\n"), it.key, cfg.c_str());
+			printf(tr("    [1] 生效 config（标记 %s 环境变量优先级下降）\n", "    [1] keep config (lower the priority of env for %s)\n"), it.key);
+			printf(tr("    [2] 生效环境变量（删除 config 里的 %s）\n", "    [2] use env var (delete %s from config)\n"), it.key);
+			printf(tr("  请选择 [1/2]（默认 1）：", "  Choose [1/2] (default 1): "));
 			fflush(stdout);
 			string choice;
 			getline(cin, choice);
@@ -1456,22 +1796,22 @@ static int cmd_config(vector<string>& args)
 				m.erase(it.key);
 				cfg_set_ignore_env(m, it.key, false);
 				save_config_map(m);
-				printf("    已删除 config.%s，环境变量生效。\n", it.key);
+				printf(tr("    已删除 config.%s，环境变量生效。\n", "    Deleted config.%s; the env var takes effect.\n"), it.key);
 			}
 			else
 			{
 				cfg_set_ignore_env(m, it.key, true);
 				save_config_map(m);
-				printf("    已标记 config.%s 优先。\n", it.key);
+				printf(tr("    已标记 config.%s 优先。\n", "    Marked config.%s as priority.\n"), it.key);
 			}
 			printf("\n");
 			continue;
 		}
 
 		string eff = get_effective(it.key, it.env, it.def());
-		string src = ignored ? "config(优先)" : (!env.empty() ? "环境变量" : (!cfg.empty() ? "config" : "默认"));
-		printf("%-16s %s\n", it.key, it.desc);
-		printf("    当前=%s  来源:%s  默认=%s\n", eff.c_str(), src.c_str(), it.def().c_str());
+		string src = cfg_src_label(ignored, !env.empty(), !cfg.empty());
+		printf("%-16s %s\n", it.key, tr(it.desc, it.desc_en));
+		printf(tr("    当前=%s  来源:%s  默认=%s\n", "    current=%s  source:%s  default=%s\n"), eff.c_str(), src.c_str(), it.def().c_str());
 		printf("    > ");
 		fflush(stdout);
 		string input;
@@ -1483,45 +1823,278 @@ static int cmd_config(vector<string>& args)
 			m.erase(it.key);
 			cfg_set_ignore_env(m, it.key, false);
 			save_config_map(m);
-			printf("    已恢复默认/环境变量。\n");
+			printf(tr("    已恢复默认/环境变量。\n", "    Reset to default/env.\n"));
 		}
 		else
 		{
 			m[it.key] = input;
 			if (!env.empty()) cfg_set_ignore_env(m, it.key, true);
 			save_config_map(m);
-			if (!env.empty()) printf("    已设置并标记 config 优先（环境变量 %s 仍存在）。\n", it.env);
-			else printf("    已设置。\n");
+			if (!env.empty()) printf(tr("    已设置并标记 config 优先（环境变量 %s 仍存在）。\n", "    Set and marked config priority (env %s still set).\n"), it.env);
+			else printf(tr("    已设置。\n", "    Set.\n"));
 		}
 		printf("\n");
 	}
-	printf("配置已保存到 %s\n", config_file().c_str());
+	printf(tr("配置已保存到 %s\n", "Config saved to %s\n"), config_file().c_str());
 	return 0;
 }
 
 static int cmd_stop(vector<string>&)
 {
 	kill_server();
-	printf("已停止 llama-server。\n");
+	printf(tr("已停止 llama-server。\n", "llama-server stopped.\n"));
+	return 0;
+}
+
+// ===================== 自更新（GitHub Release） =====================
+// "v1.2.3" → [1,2,3]（解析失败返回空）
+static vector<int> ver_parts(const string& v)
+{
+	string s = v;
+	if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) s = s.substr(1);
+	vector<int> r;
+	string cur;
+	for (char c : s)
+	{
+		if (c == '.') { r.push_back(atoi(cur.c_str())); cur.clear(); }
+		else if (isdigit((unsigned char)c)) cur += c;
+		else if (!cur.empty()) { r.push_back(atoi(cur.c_str())); cur.clear(); }
+	}
+	if (!cur.empty()) r.push_back(atoi(cur.c_str()));
+	return r;
+}
+
+static int ver_cmp(const string& a, const string& b)
+{
+	auto va = ver_parts(a), vb = ver_parts(b);
+	size_t n = max(va.size(), vb.size());
+	for (size_t i = 0; i < n; i++)
+	{
+		int x = i < va.size() ? va[i] : 0;
+		int y = i < vb.size() ? vb[i] : 0;
+		if (x != y) return x < y ? -1 : 1;
+	}
+	return 0;
+}
+
+// 当前可执行文件绝对路径（Windows: GetModuleFileName；Unix: /proc/self/exe）
+static string current_exe_path()
+{
+#ifdef _WIN32
+	char buf[MAX_PATH];
+	DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+	if (n > 0 && n < MAX_PATH) return string(buf);
+#else
+	char buf[4096];
+	ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+	if (n > 0) { buf[n] = 0; return string(buf); }
+#endif
+	return "简单备忘录.exe"; // 兜底：当前目录相对名
+}
+
+// 检查 GitHub 最新 release：0=成功；1=网络/解析失败；2=有 release 但没有可执行资产
+static int fetch_latest_release(string& tag, string& asset_url, string& asset_name)
+{
+	string resp = http_get(string("https://api.github.com/repos/") + MEMO_REPO + "/releases/latest");
+	if (resp.empty()) return 1;
+	Json j = json_parse(resp);
+	Json* t = j.find("tag_name");
+	Json* assets = j.find("assets");
+	if (!t || t->t != Json::Str || !assets || assets->t != Json::Arr) return 1;
+	tag = t->s;
+	// 优先精确 simple-memo.exe，其次任意 .exe 资产
+	for (auto& a : assets->arr)
+	{
+		Json* n = a.find("name");
+		Json* u = a.find("browser_download_url");
+		if (!n || !u || n->t != Json::Str || u->t != Json::Str) continue;
+		if (n->s == "simple-memo.exe") { asset_url = u->s; asset_name = n->s; return 0; }
+	}
+	for (auto& a : assets->arr)
+	{
+		Json* n = a.find("name");
+		Json* u = a.find("browser_download_url");
+		if (!n || !u || n->t != Json::Str || u->t != Json::Str) continue;
+#ifdef _WIN32
+		if (n->s.size() > 4 && n->s.substr(n->s.size() - 4) == ".exe")
+#else
+		if (n->s.size() > 3 && n->s.substr(n->s.size() - 3) == ".sh")
+#endif
+		{ asset_url = u->s; asset_name = n->s; return 0; }
+	}
+	return 2;
+}
+
+static int cmd_update(vector<string>& args)
+{
+	bool force = false;
+	for (auto& a : args) if (a == "-f" || a == "--force") force = true;
+
+	printf(tr("正在检查更新（%s，当前 %s）...\n", "Checking for updates (%s, current %s)...\n"), MEMO_REPO, MEMO_VERSION);
+	string tag, url, asset;
+	int fetch = fetch_latest_release(tag, url, asset);
+	if (fetch == 1)
+	{
+		printf(tr("无法获取最新版本信息（网络？请开代理/WARP 后重试）。\n", "Failed to fetch release info (network? try WARP/proxy).\n"));
+		return 1;
+	}
+	if (fetch == 2)
+	{
+		printf(tr("最新 release %s 没有可执行资产（simple-memo.exe），无法自动更新。\n",
+		          "Latest release %s has no executable asset (simple-memo.exe); cannot auto-update.\n"), tag.c_str());
+		return 1;
+	}
+
+	printf(tr("当前 %s → 最新 %s\n", "Current %s → latest %s\n"), MEMO_VERSION, tag.c_str());
+	int cmp = ver_cmp(MEMO_VERSION, tag);
+	if (cmp >= 0 && !force) // 相同或本地更新（远端未发布新 tag）→ 无需更新
+	{
+		printf(tr("已是最新版本（--force 可强制重装）。\n", "Already up to date (use --force to reinstall).\n"));
+		return 0;
+	}
+	if (cmp == 0 && force) printf(tr("版本相同，--force 强制重装。\n", "Same version; --force reinstalling.\n"));
+
+	ensure_data_dir();
+	string tmp = data_dir() + "/.update-download.bin";
+	printf(tr("下载 %s ...\n", "Downloading %s ...\n"), url.c_str());
+	if (!curl_download(url, tmp))
+	{
+		printf(tr("下载失败（github.com 可能被墙，请开代理/WARP 后重试）。\n", "Download failed (github.com may be blocked; try WARP/proxy).\n"));
+		return 1;
+	}
+
+	// 校验：非空且 Windows PE 头为 MZ（防下载到 HTML 错误页）
+	{
+		ifstream f(tmp, ios::binary);
+		char head[2] = { 0, 0 };
+		streamsize sz = 0;
+		if (f) { f.seekg(0, ios::end); sz = f.tellg(); f.seekg(0); f.read(head, 2); }
+#ifdef _WIN32
+		bool ok = sz > 100000 && head[0] == 'M' && head[1] == 'Z';
+#else
+		(void)head;
+		bool ok = sz > 100000;
+#endif
+		if (!ok)
+		{
+			printf(tr("下载的文件不像可执行程序（%lld 字节），已中止。\n", "Downloaded file does not look like an executable (%lld bytes); aborted.\n"), (ll)sz);
+			error_code ec;
+			filesystem::remove(tmp, ec);
+			return 1;
+		}
+	}
+
+	// 自替换：运行中的 exe 不能直接覆盖，但可改名 → 旧文件挪走，新文件就位
+	string self = current_exe_path();
+	string old = self + ".old";
+	error_code ec;
+	filesystem::remove(old, ec);
+	filesystem::rename(self, old, ec);
+	if (ec)
+	{
+		printf(tr("无法替换 %s（权限？手动放置 %s 后重试）。\n", "Cannot replace %s (permission? place %s manually and retry).\n"), self.c_str(), tmp.c_str());
+		return 1;
+	}
+	filesystem::copy_file(tmp, self, filesystem::copy_options::overwrite_existing, ec);
+	filesystem::remove(tmp, ec);
+	if (ec)
+	{
+		printf(tr("写入新版本失败：%s。旧版本已保留在 %s。\n", "Failed to write the new version: %s. The old one is kept at %s.\n"), ec.message().c_str(), self.c_str());
+		return 1;
+	}
+
+	// 清理旧文件：运行中删不掉则后台延迟删除
+	ec.clear();
+	filesystem::remove(old, ec);
+	if (ec)
+	{
+#ifdef _WIN32
+		string d = "cmd /c ping -n 3 127.0.0.1 >nul & del \"" + old + "\" >nul 2>nul";
+		system(d.c_str());
+#endif
+		printf(tr("旧版本 %s.old 将在退出后自动删除。\n", "The old version %s.old will be deleted after exit.\n"), self.c_str());
+	}
+
+	printf(tr("已更新到 %s（%s）。REPL 中请重启后生效。\n", "Updated to %s (%s). Restart to take effect if in REPL.\n"), tag.c_str(), self.c_str());
 	return 0;
 }
 
 static void print_help()
 {
+	if (lang_is_en())
+	{
+		printf(
+			"Simple Memo — command help (version %s)\n"
+			"\n"
+			"  add <title> [body...]\n"
+			"      Add a memo. Blank lines in the body split it into paragraphs; each paragraph\n"
+			"      gets its own vector. A single newline stays inside the paragraph. In REPL,\n"
+			"      omitting the body enters multi-line input; a lone :end line finishes.\n"
+			"  edit <id>\n"
+			"      Edit title and body of <id> in an external editor; vectors are recomputed on save.\n"
+			"      Editor chain: config editor / $EDITOR > $VISUAL > platform default (Win: edit→notepad;\n"
+			"      Linux/macOS: nano→vi). First line of the file is the title, then one ==== line, then the body.\n"
+			"  delete <id>   Delete a memo (aliases: del / rm)\n"
+			"\n"
+			"  list   List all memos (alias: ls)\n"
+			"  show <id>   Show the full content of <id>\n"
+			"  show -f/--follow   Show the last active memo (add / edit / first search hit / first find hit)\n"
+			"\n"
+			"  search <keywords...> [--any] [-l|--list]\n"
+			"      Multi-keyword substring search, case-insensitive.\n"
+			"      <keywords...>  one or more keywords\n"
+			"      --any          switch to OR: match if any keyword hits (default AND: all must hit)\n"
+			"      -l/--list      titles only; by default prints hit lines ±2 lines of context (hit line marked <-)\n"
+			"  find <semantic query> [-nK] [-l|--list]\n"
+			"      Vector semantic search, matched per paragraph.\n"
+			"      <semantic query>  describe what you are looking for in natural language\n"
+			"      -nK               show top K results only (e.g. -n3; default 5)\n"
+			"      -l/--list         titles only; by default prints the matched paragraph (truncated at 18 chars)\n"
+			"\n"
+			"  reindex [--all]   Recompute vectors (default: pending only; --all rebuilds everything)\n"
+			"  stop              Stop the background llama-server to free memory\n"
+			"  update [-f]       Self-update from GitHub Releases (-f/--force reinstall even if same version)\n"
+			"  config            Interactive config (Enter=keep, new value=change, '-'=reset to default)\n"
+			"  config get [key]  View config; config set <key> <value> to set; config unset <key> to remove\n"
+			"      Keys: hf_endpoint / embed_hf_repo / embed_hf_file / server_port / llama_server_exe / editor / language\n"
+			"\n"
+			"  help / ?   Show this help\n"
+			"  quit / exit / q   Exit (REPL only)\n"
+			"\n"
+			"Environment variables:\n"
+			"  MEMO_DATA_DIR         Data directory (default ~/.simple_memo)\n"
+			"  MEMO_LLAMA_SERVER_EXE Path to llama-server(.exe)\n"
+			"  MEMO_SERVER_PORT      Local embedding port (default 8732)\n"
+			"  MEMO_EMBED_HF_REPO    Embedding model HF repo\n"
+			"  MEMO_EMBED_HF_FILE    Embedding model GGUF file name\n"
+			"  MEMO_HF_ENDPOINT      HF mirror endpoint (empty = official)\n"
+			"  MEMO_LANG             UI language (zh / en, default zh)\n"
+			"\n"
+			"  EDITOR / VISUAL       External editor for memos (default: Win=edit→notepad; Linux/macOS=nano→vi)\n",
+			MEMO_VERSION);
+		return;
+	}
 	printf(
-		"简单备忘录 —— 命令帮助\n"
+		"简单备忘录 —— 命令帮助（版本 %s）\n"
 		"\n"
 		"  add <标题> [正文...]\n"
 		"      新增一条备忘录。正文中的空行会把内容分成多个段落，每个段落独立计算向量；\n"
 		"      单个换行不换段。REPL 模式下若省略正文，则进入多行输入，单独一行 :end 结束。\n"
 		"  edit <id>\n"
 		"      用外部编辑器修改指定 id 的标题和正文，保存关闭后自动重算向量。\n"
-		"      编辑器顺序：$EDITOR > $VISUAL > notepad。文件首行为标题，其后一行 ==== 分隔正文。\n"
+		"      编辑器顺序：config editor / $EDITOR > $VISUAL > 平台默认（Win: edit→notepad；Linux/macOS: nano→vi）。\n"
+		"      文件首行为标题，其后一行 ==== 分隔正文。\n"
 		"  delete <id>   删除指定 id（别名：del / rm）\n"
 		"\n"
 		"  list   列出全部备忘录（别名：ls）\n"
-		"  show <id>   查看指定 id 的完整内容\n"
-		"  show -f/--follow   显示上一个活跃的备忘录（add / edit / search 首命中 / find 首命中）\n"
+		"  show <id> [选项]\n"
+		"      查看指定 id 的内容。选项：\n"
+		"      -f/--follow    显示上一个活跃的备忘录（add / edit / search 首命中 / find 首命中）\n"
+		"      -m/--markdown  渲染 Markdown（标题 / 粗体 / 斜体 / 代码 / 列表 / 引用）\n"
+		"      --limit=<n>L|P 只看前 n 行（L）或前 n 段（P）\n"
+		"      --from=<n>L|P  从第 n 行 / 段开始（1 起）\n"
+		"      --all          显示全部（过大时仍设上限，尽可能多显示）\n"
+		"      备忘录过大时默认只显示一部分；未显示完全会在首尾提示省略了多少。\n"
 		"\n"
 		"  search <关键词...> [--any] [-l|--list]\n"
 		"      多关键词子串搜索，不区分大小写。\n"
@@ -1536,9 +2109,10 @@ static void print_help()
 		"\n"
 		"  reindex [--all]   重算向量（默认只补算 pending；--all 全量重建）\n"
 		"  stop              停止后台 llama-server，释放内存\n"
+		"  update [-f]       从 GitHub Release 自更新（-f/--force 强制替换，即使版本相同）\n"
 		"  config            交互式配置（回车保持 / 输入新值 / 输入 - 恢复默认）\n"
 		"  config get [key]  查看配置；config set <key> <value> 设置；config unset <key> 移除\n"
-		"      可配置项：hf_endpoint / embed_hf_repo / embed_hf_file / server_port / llama_server_exe / editor\n"
+		"      可配置项：hf_endpoint / embed_hf_repo / embed_hf_file / server_port / llama_server_exe / editor / language\n"
 		"\n"
 		"  help / ?   显示本帮助\n"
 		"  quit / exit / q   退出（仅 REPL 模式）\n"
@@ -1550,8 +2124,10 @@ static void print_help()
 		"  MEMO_EMBED_HF_REPO    嵌入模型 HF 仓库\n"
 		"  MEMO_EMBED_HF_FILE    嵌入模型 GGUF 文件名\n"
 		"  MEMO_HF_ENDPOINT      HF 镜像地址（国内加速，置空使用官方）\n"
+		"  MEMO_LANG             界面语言（zh / en，默认 zh）\n"
 		"\n"
-		"  EDITOR / VISUAL      编辑备忘录使用的外部编辑器（默认 notepad）\n");
+		"  EDITOR / VISUAL      编辑备忘录使用的外部编辑器（默认：Win=edit→notepad；Linux/macOS=nano→vi）\n",
+		MEMO_VERSION);
 }
 
 static int dispatch(vector<string>& args)
@@ -1569,17 +2145,44 @@ static int dispatch(vector<string>& args)
 	if (c == "reindex") return cmd_reindex(rest);
 	if (c == "config") return cmd_config(rest);
 	if (c == "stop") return cmd_stop(rest);
+	if (c == "update") return cmd_update(rest);
 	if (c == "help" || c == "?") { print_help(); return 0; }
-	if (c == "quit" || c == "exit" || c == "q") { printf("（quit 仅在 REPL 下使用）\n"); return 0; }
-	printf("未知命令：%s（输入 help 查看）\n", c.c_str());
+	if (c == "quit" || c == "exit" || c == "q") { printf(tr("（quit 仅在 REPL 下使用）\n", "(quit is REPL-only)\n")); return 0; }
+	printf(tr("未知命令：%s（输入 help 查看）\n", "Unknown command: %s (type help)\n"), c.c_str());
 	return 1;
 }
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
 	SetConsoleOutputCP(65001);
 	SetConsoleCP(65001);
+	// 开启 VT 处理 → show -m 的 ANSI 颜色可用；重定向/老终端则自动退回纯文本
+	{
+		HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+		DWORD mode = 0;
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+		if (GetConsoleMode(h, &mode))
+			g_ansi_ok = SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+		else g_ansi_ok = false;
+	}
+#else
+	setlocale(LC_ALL, "");
+#endif
 	ensure_data_dir();
+
+	// 清理上次异常退出残留的编辑临时文件（.edit-<id>.txt）
+	{
+		error_code ec;
+		for (auto& e : filesystem::directory_iterator(data_dir(), ec))
+		{
+			string nm = e.path().filename().string();
+			if (nm.size() > 10 && nm.substr(0, 6) == ".edit-" && nm.substr(nm.size() - 4) == ".txt")
+				filesystem::remove(e.path(), ec);
+		}
+	}
 
 	// 启动时扫描 env 与 config 冲突：REPL 交互式，子命令非交互（值相同自动删 config）
 	scan_config_conflicts(argc <= 1);
@@ -1597,9 +2200,10 @@ int main(int argc, char** argv)
 	g_repl = true;
 	int dv = vec_schema_version_on_disk();
 	if (dv != 0 && dv < (int)VEC_SCHEMA_VERSION)
-		printf("提示：向量格式已更新（旧 v%d → 新 v%d），请运行 reindex --all 重算。\n",
+		printf(tr("提示：向量格式已更新（旧 v%d → 新 v%d），请运行 reindex --all 重算。\n",
+		          "Note: vector format updated (old v%d → new v%d); run reindex --all to rebuild.\n"),
 		       dv, (int)VEC_SCHEMA_VERSION);
-	printf("简单备忘录 REPL（输入 help 查看，quit 退出）\n");
+	printf(tr("简单备忘录 REPL（输入 help 查看，quit 退出）\n", "Simple Memo REPL (type help for usage, quit to exit)\n"));
 	string line;
 	while (true)
 	{
