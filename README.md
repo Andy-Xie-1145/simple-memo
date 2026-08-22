@@ -24,11 +24,19 @@ REPL: run without arguments. 无参数进入 REPL。
 
 ## Build / 编译
 
+Windows (MinGW-w64, static, no runtime DLLs / 静态链接，无运行库依赖):
+
 ```bash
 g++ -static -static-libgcc -static-libstdc++ -Wall -Wextra -O2 -std=c++17 "简单备忘录.cpp" -o simple-memo.exe
 ```
 
-Static linking: no MinGW runtime DLLs required. 静态链接，产物不依赖 MinGW 运行库。
+Linux / macOS:
+
+```bash
+g++ -Wall -Wextra -O2 -std=c++17 简单备忘录.cpp -o simple-memo
+```
+
+Runtime deps: `curl` (server/download), `tar` or `unzip` (first-run llama.cpp extract). 运行依赖 `curl`、`tar`/`unzip`（首次解压 llama.cpp）。
 
 Or download a prebuilt binary from [Releases](../../releases). 或直接从 [Releases](../../releases) 下载。
 

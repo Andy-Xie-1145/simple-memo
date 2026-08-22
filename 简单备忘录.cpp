@@ -2,8 +2,30 @@
 // 嵌入由本地 llama.cpp（llama-embedding 子进程 + embeddinggemma-300m）提供，首次自动下载
 // 编译：g++.exe -Wall -Wextra -g3 -O2 -std=c++17 "简单备忘录.cpp" -o "output/简单备忘录.exe"
 
-#include <bits/stdc++.h>
+// 显式标准头（不依赖 GCC 专属的 bits/stdc++.h，clang/libc++ 也可编译）
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <climits>
+#include <cmath>
+#include <csetjmp>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 #include <filesystem>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -38,7 +60,22 @@ static string data_dir()
 static string memos_path() { return data_dir() + "/memos.jsonl"; }
 static string vectors_path() { return data_dir() + "/vectors.bin"; }
 static string llama_dir() { return data_dir() + "/llama"; }
-static string llama_server_default() { return llama_dir() + "/llama-server.exe"; }
+// 平台空设备（shell 重定向用）
+#ifdef _WIN32
+static const char* NULL_DEV = "nul";
+#else
+static const char* NULL_DEV = "/dev/null";
+#endif
+// llama-server 二进制名：Win 带 .exe，Unix 无后缀
+static string llama_server_bin_name()
+{
+#ifdef _WIN32
+	return "llama-server.exe";
+#else
+	return "llama-server";
+#endif
+}
+static string llama_server_default() { return llama_dir() + "/" + llama_server_bin_name(); }
 
 // 配置持久化（config.json）：前置声明，实现在下方（依赖 trim / ensure_data_dir）
 static string config_file();
@@ -514,7 +551,8 @@ static bool curl_download(const string& url, const string& dest)
 // ===================== Embedding（llama.cpp 子进程） =====================
 static string g_last_err;
 
-// 查 llama.cpp 最新 release 的 Windows AVX2 zip 下载地址
+// 查 llama.cpp 最新 release 中本平台的 zip 下载地址
+// Win: bin-win-cpu-x64（新版）/ bin-win-avx2-x64（旧版）；Linux: bin-ubuntu-x64；macOS: bin-macos-arm64 / bin-macos-x64
 static string find_llama_release_url()
 {
 	string resp = http_get("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest");
@@ -522,28 +560,52 @@ static string find_llama_release_url()
 	Json j = json_parse(resp);
 	Json* assets = j.find("assets");
 	if (!assets || assets->t != Json::Arr) return "";
-	string avx2, fallback;
+#ifdef _WIN32
+	const string want = "bin-win-cpu-x64", legacy = "bin-win-avx2-x64", loose = "bin-win-";
+#elif defined(__APPLE__)
+#if defined(__aarch64__)
+	const string want = "bin-macos-arm64", legacy = "bin-macos-avx", loose = "bin-macos-";
+#else
+	const string want = "bin-macos-x64", legacy = "bin-macos-avx", loose = "bin-macos-";
+#endif
+#else
+	const string want = "bin-ubuntu-x64", legacy = "bin-ubuntu", loose = "bin-ubuntu";
+#endif
+	string best, legacy_hit, fallback;
 	for (auto& a : assets->arr)
 	{
 		Json* name = a.find("name");
 		Json* url = a.find("browser_download_url");
-		if (!name || !url || url->t != Json::Str) continue;
-		// 新版 llama.cpp 用 bin-win-cpu-x64（旧版 bin-win-avx2-x64）
+		if (!name || name->t != Json::Str || !url || url->t != Json::Str) continue;
 		const string& n = name->s;
-		if (n.find("bin-win-cpu-x64") != string::npos || n.find("bin-win-avx2-x64") != string::npos) avx2 = url->s;
-		else if (n.find("bin-win-x64") != string::npos && fallback.empty()) fallback = url->s;
+		if (n.size() < 4 || n.substr(n.size() - 4) != ".zip") continue; // 只认 zip 资产
+		if (n.find(want) != string::npos) best = url->s;
+		else if (!legacy.empty() && n.find(legacy) != string::npos && legacy_hit.empty()) legacy_hit = url->s;
+		else if (n.find(loose) != string::npos && fallback.empty()) fallback = url->s;
 	}
-	return !avx2.empty() ? avx2 : fallback;
+	return !best.empty() ? best : (!legacy_hit.empty() ? legacy_hit : fallback);
 }
 
-// 验证 llama-server.exe 可正常执行（--version 打印版本后退出，不启动 server）
+// 验证 llama-server 可正常执行（--version 打印版本后退出，不启动 server）
 static bool llama_server_works()
 {
-	string cmd = "\"" + llama_server_path() + "\" --version > nul 2>nul";
+	string cmd = "\"" + llama_server_path() + "\" --version > " + NULL_DEV + " 2>" + NULL_DEV;
 	return system(cmd.c_str()) == 0;
 }
 
-// 确保 llama-server.exe 可用；已存在但损坏则清理重下（自愈）。失败设 g_last_err
+// 解压 zip 到目录：Win 用系统自带 tar（bsdtar，Win10+）；Unix 依次尝试 unzip → python3 → tar
+static bool extract_archive(const string& arc, const string& dir)
+{
+#ifdef _WIN32
+	return system(("tar -xf \"" + arc + "\" -C \"" + dir + "\"").c_str()) == 0;
+#else
+	if (system(("unzip -oq \"" + arc + "\" -d \"" + dir + "\"").c_str()) == 0) return true;
+	if (system(("python3 -m zipfile -e \"" + arc + "\" \"" + dir + "/\"").c_str()) == 0) return true;
+	return system(("tar -xf \"" + arc + "\" -C \"" + dir + "\"").c_str()) == 0;
+#endif
+}
+
+// 确保 llama-server 可用；已存在但损坏则清理重下（自愈）。失败设 g_last_err
 static bool ensure_llama_binary()
 {
 	// 已存在且可执行 → 跳过
@@ -554,7 +616,7 @@ static bool ensure_llama_binary()
 	bool user_set = !explicit_exe.empty() && explicit_exe != llama_server_default();
 	if (user_set)
 	{
-		g_last_err = string(tr("llama-server.exe 指定的文件不可用: ", "configured llama-server.exe is not usable: ")) + llama_server_path();
+		g_last_err = string(tr("llama-server 指定的文件不可用: ", "configured llama-server is not usable: ")) + llama_server_path();
 		return false;
 	}
 
@@ -562,8 +624,8 @@ static bool ensure_llama_binary()
 	error_code ec;
 	if (filesystem::exists(llama_server_default(), ec))
 	{
-		printf(tr("  llama-server.exe 不可用（损坏/不完整？），清理后重新下载...\n",
-		          "  llama-server.exe not usable (corrupt/incomplete?); cleaning and re-downloading...\n"));
+		printf(tr("  llama-server 不可用（损坏/不完整？），清理后重新下载...\n",
+		          "  llama-server not usable (corrupt/incomplete?); cleaning and re-downloading...\n"));
 		filesystem::remove_all(llama_dir(), ec);
 	}
 
@@ -584,12 +646,19 @@ static bool ensure_llama_binary()
 	}
 
 	filesystem::create_directories(llama_dir(), ec);
-	string untar = "tar -xf \"" + zip + "\" -C \"" + llama_dir() + "\"";
-	int rc = system(untar.c_str());
+	if (!extract_archive(zip, llama_dir()))
+	{
+		filesystem::remove(zip, ec);
+		g_last_err = tr("解压 llama.cpp release 失败", "failed to extract llama.cpp release");
+		return false;
+	}
 	filesystem::remove(zip, ec);
-	if (rc != 0) { g_last_err = tr("解压 llama.cpp release 失败", "failed to extract llama.cpp release"); return false; }
+#ifndef _WIN32
+	// zip 不保留执行位 → 解压后补 chmod +x（递归整个目录，llama-server 及附带工具都需要）
+	(void)system(("chmod +x \"" + llama_dir() + "\"/* 2>/dev/null").c_str());
+#endif
 
-	if (!llama_server_works()) { g_last_err = tr("下载后 llama-server.exe 仍不可用（zip 可能损坏，请重试）", "llama-server.exe still unusable after download (zip may be corrupt, retry)"); return false; }
+	if (!llama_server_works()) { g_last_err = tr("下载后 llama-server 仍不可用（zip 可能损坏，请重试）", "llama-server still unusable after download (zip may be corrupt; retry)"); return false; }
 	printf(tr("  llama.cpp 就绪。\n", "  llama.cpp ready.\n"));
 	return true;
 }
@@ -601,7 +670,7 @@ static string http_post_json(const string& url, const string& body)
 	string bf = data_dir() + "/.body.json";
 	{ ofstream f(bf, ios::binary); f << body; }
 	string out = data_dir() + "/.post.txt";
-	string cmd = "curl -s -m 60 -X POST -H \"Content-Type: application/json\" --data-binary \"@" + bf + "\" \"" + url + "\" > \"" + out + "\" 2>nul";
+	string cmd = "curl -s -m 60 -X POST -H \"Content-Type: application/json\" --data-binary \"@" + bf + "\" \"" + url + "\" > \"" + out + "\" 2>" + NULL_DEV;
 	system(cmd.c_str());
 	string resp;
 	ifstream f(out, ios::binary);
@@ -614,7 +683,7 @@ static bool server_health()
 {
 	ensure_data_dir();
 	string codef = data_dir() + "/.code.txt";
-	string cmd = "curl -s -m 10 -w \"%{http_code}\" -o nul \"http://127.0.0.1:" + to_string(server_port()) + "/health\" > \"" + codef + "\" 2>nul";
+	string cmd = "curl -s -m 10 -w \"%{http_code}\" -o " + string(NULL_DEV) + " \"http://127.0.0.1:" + to_string(server_port()) + "/health\" > \"" + codef + "\" 2>" + NULL_DEV;
 	system(cmd.c_str());
 	string code;
 	ifstream f(codef);
@@ -1877,19 +1946,25 @@ static int ver_cmp(const string& a, const string& b)
 	return 0;
 }
 
-// 当前可执行文件绝对路径（Windows: GetModuleFileName；Unix: /proc/self/exe）
+// 当前可执行文件绝对路径（Windows: GetModuleFileName；Linux: /proc/self/exe；macOS: _NSGetExecutablePath）
 static string current_exe_path()
 {
-#ifdef _WIN32
-	char buf[MAX_PATH];
-	DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
-	if (n > 0 && n < MAX_PATH) return string(buf);
-#else
 	char buf[4096];
+#ifdef _WIN32
+	DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+	if (n > 0 && n < MAX_PATH) return string(buf, n);
+#elif defined(__APPLE__)
+	uint32_t sz = sizeof(buf);
+	if (_NSGetExecutablePath(buf, &sz) == 0) return string(buf);
+#else
 	ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
 	if (n > 0) { buf[n] = 0; return string(buf); }
 #endif
-	return "简单备忘录.exe"; // 兜底：当前目录相对名
+#ifdef _WIN32
+	return "simple-memo.exe"; // 兜底：当前目录相对名
+#else
+	return "./simple-memo";
+#endif
 }
 
 // 检查 GitHub 最新 release：0=成功；1=网络/解析失败；2=有 release 但没有可执行资产
@@ -1902,23 +1977,30 @@ static int fetch_latest_release(string& tag, string& asset_url, string& asset_na
 	Json* assets = j.find("assets");
 	if (!t || t->t != Json::Str || !assets || assets->t != Json::Arr) return 1;
 	tag = t->s;
-	// 优先精确 simple-memo.exe，其次任意 .exe 资产
+	// 优先精确本平台资产名（Win: simple-memo.exe；Unix: simple-memo），其次同前缀的其他二进制资产
+#ifdef _WIN32
+	const string exact = "simple-memo.exe";
+#else
+	const string exact = "simple-memo";
+#endif
 	for (auto& a : assets->arr)
 	{
 		Json* n = a.find("name");
 		Json* u = a.find("browser_download_url");
 		if (!n || !u || n->t != Json::Str || u->t != Json::Str) continue;
-		if (n->s == "simple-memo.exe") { asset_url = u->s; asset_name = n->s; return 0; }
+		if (n->s == exact) { asset_url = u->s; asset_name = n->s; return 0; }
 	}
 	for (auto& a : assets->arr)
 	{
 		Json* n = a.find("name");
 		Json* u = a.find("browser_download_url");
 		if (!n || !u || n->t != Json::Str || u->t != Json::Str) continue;
+		const string& s = n->s;
 #ifdef _WIN32
-		if (n->s.size() > 4 && n->s.substr(n->s.size() - 4) == ".exe")
+		if (s.size() > 4 && s.substr(s.size() - 4) == ".exe")
 #else
-		if (n->s.size() > 3 && n->s.substr(n->s.size() - 3) == ".sh")
+		// Unix 二进制无后缀（simple-memo-linux / simple-memo-macos 等），排除带扩展名的附带文件
+		if (s.find("simple-memo") == 0 && s.find('.') == string::npos)
 #endif
 		{ asset_url = u->s; asset_name = n->s; return 0; }
 	}
@@ -2002,6 +2084,10 @@ static int cmd_update(vector<string>& args)
 		printf(tr("写入新版本失败：%s。旧版本已保留在 %s。\n", "Failed to write the new version: %s. The old one is kept at %s.\n"), ec.message().c_str(), self.c_str());
 		return 1;
 	}
+#ifndef _WIN32
+	// 下载的文件无执行位 → 补 chmod +x，否则替换后无法运行
+	(void)system(("chmod +x \"" + self + "\" 2>/dev/null").c_str());
+#endif
 
 	// 清理旧文件：运行中删不掉则后台延迟删除
 	ec.clear();
@@ -2119,7 +2205,7 @@ static void print_help()
 		"\n"
 		"环境变量：\n"
 		"  MEMO_DATA_DIR         数据目录（默认 ~/.simple_memo）\n"
-		"  MEMO_LLAMA_SERVER_EXE llama-server.exe 路径\n"
+		"  MEMO_LLAMA_SERVER_EXE llama-server 路径\n"
 		"  MEMO_SERVER_PORT      本地 embedding 端口（默认 8732）\n"
 		"  MEMO_EMBED_HF_REPO    嵌入模型 HF 仓库\n"
 		"  MEMO_EMBED_HF_FILE    嵌入模型 GGUF 文件名\n"
