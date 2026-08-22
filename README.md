@@ -9,10 +9,10 @@
 | 命令 | 说明 |
 |---|---|
 | `add <title> [body...]` | 新增备忘录；正文空行分段，每段独立向量化 |
-| `edit <id>` | 外部编辑器编辑（`$EDITOR > $VISUAL > edit→notepad / nano→vi`），保存后重算向量 |
-| `delete <id>` | 删除（`del` / `rm`） |
+| `edit <id|标题片段>` | 外部编辑器编辑（`$EDITOR > $VISUAL > edit→notepad / nano→vi`），保存后重算向量 |
+| `delete <id|标题片段> [-y]` | 删除，需确认（`-y` 跳过；`del` / `rm`） |
 | `list` / `ls` | 列出全部 |
-| `show <id> [opts]` | 查看内容：`-f` 上一个活跃、`-m` 渲染 Markdown、`--limit=nL/nP` + `--from=nL/nP` 分页、`--all` 全部（过大自动截断并提示） |
+| `show <id|标题片段> [opts]` | 查看内容：`-f` 上一个活跃、`-m` 渲染 Markdown、`--limit=nL/nP` + `--from=nL/nP` 分页、`--all` 全部（过大自动截断并提示） |
 | `search <kw...> [--any] [-l]` | 子串搜索（默认 AND，`--any` 切 OR）；默认输出命中行 ±2 行上下文 |
 | `find <query> [-nK] [-l]` | 语义搜索，按段落匹配 Top-K |
 | `reindex [--all]` | 补算 pending 向量；`--all` 全量重建 |

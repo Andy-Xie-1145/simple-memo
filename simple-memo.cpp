@@ -183,7 +183,7 @@ static string get_effective(const string& key, const string& env_name, const str
 
 // ===================== i18n / 版本 =====================
 // 本程序版本（与 GitHub Release tag 对应，update 子命令据此比较）
-static const char* MEMO_VERSION = "v0.2.0";
+static const char* MEMO_VERSION = "v0.2.1";
 static const char* MEMO_REPO = "Andy-Xie-1145/simple-memo";
 
 // 界面语言：config language / 环境变量 MEMO_LANG（zh|en，默认 zh）。
@@ -1250,10 +1250,14 @@ static bool parse_unit_val(const string& v, ll& n, char& unit)
 	return true;
 }
 
+// id/标题定位（定义于下方 cmd_delete 前；show/edit 共用）
+static bool resolve_ref(vector<Memo>& ms, const string& ref, ll& id);
+
 static int cmd_show(vector<string>& args)
 {
 	bool follow = false, md = false, all = false, has_id = false;
 	ll id = 0;
+	string ref;
 	ll limit_n = -1, from_n = 1;
 	char limit_unit = 'L', from_unit = 'L';
 	for (size_t i = 0; i < args.size(); i++)
@@ -1284,12 +1288,12 @@ static int cmd_show(vector<string>& args)
 				return 1;
 			}
 		}
-		else { id = atoll(a.c_str()); has_id = true; }
+		else { ref = a; has_id = true; }
 	}
 	if (!has_id && !follow)
 	{
-		printf(tr("用法: show <id> [-f] [-m] [--limit=nL|nP] [--from=nL|nP] [--all]\n",
-		          "Usage: show <id> [-f] [-m] [--limit=nL|nP] [--from=nL|nP] [--all]\n"));
+		printf(tr("用法: show <id|标题片段> [-f] [-m] [--limit=nL|nP] [--from=nL|nP] [--all]\n",
+		          "Usage: show <id|title fragment> [-f] [-m] [--limit=nL|nP] [--from=nL|nP] [--all]\n"));
 		return 1;
 	}
 	if (follow && !has_id)
@@ -1299,6 +1303,7 @@ static int cmd_show(vector<string>& args)
 	}
 
 	auto ms = load_memos();
+	if (has_id && !resolve_ref(ms, ref, id)) return 1;
 	for (auto& m : ms) if (m.id == id)
 	{
 		g_last_active_id = id;
@@ -1524,20 +1529,77 @@ static int cmd_find(vector<string>& args)
 	return 0;
 }
 
+// ===================== id / 标题定位 =====================
+// 纯数字按 id；否则按标题片段（不区分大小写子串）唯一匹配。
+// 成功 true 并设 id；失败已打印原因（0 命中 / 多命中列候选）。
+static bool resolve_ref(vector<Memo>& ms, const string& ref, ll& id)
+{
+	bool numeric = !ref.empty() && ref.find_first_not_of("0123456789") == string::npos;
+	if (numeric)
+	{
+		id = atoll(ref.c_str());
+		for (auto& m : ms) if (m.id == id) return true;
+		printf(tr("找不到 #%lld\n", "memo #%lld not found\n"), id);
+		return false;
+	}
+	string low = lower(ref);
+	vector<pair<ll, string>> hits;
+	for (auto& m : ms) if (lower(m.title).find(low) != string::npos) hits.push_back({ m.id, m.title });
+	if (hits.size() == 1)
+	{
+		id = hits[0].first;
+		return true;
+	}
+	if (hits.empty())
+	{
+		printf(tr("没有标题含「%s」的备忘录（也可直接用 id）。\n", "No memo title contains \"%s\" (or use an id).\n"), ref.c_str());
+		return false;
+	}
+	printf(tr("「%s」匹配到 %d 条，请用 id 或更精确的片段：\n", "\"%s\" matches %d memos; use an id or a more specific fragment:\n"), ref.c_str(), (int)hits.size());
+	for (auto& h : hits) printf("  #%lld  %s\n", h.first, h.second.c_str());
+	return false;
+}
+
 static int cmd_delete(vector<string>& args)
 {
-	if (args.empty()) { printf(tr("用法: delete <id>\n", "Usage: delete <id>\n")); return 1; }
-	ll id = atoll(args[0].c_str());
+	string ref;
+	bool yes = false;
+	for (auto& a : args)
+	{
+		if (a == "-y" || a == "--yes") yes = true;
+		else if (ref.empty()) ref = a;
+	}
+	if (ref.empty()) { printf(tr("用法: delete <id|标题片段> [-y]\n", "Usage: delete <id|title fragment> [-y]\n")); return 1; }
+
 	auto ms = load_memos();
-	bool found = false;
+	ll id = 0;
+	if (!resolve_ref(ms, ref, id)) return 1;
+
+	string title;
+	for (auto& m : ms) if (m.id == id) title = m.title;
+
+	// 删除不可恢复 → 二次确认（-y 跳过；非交互管道下默认拒绝）
+	if (!yes)
+	{
+		printf(tr("将删除 #%lld「%s」（不可恢复）。确认？(y/N) ", "Delete #%lld \"%s\" (irreversible)? (y/N) "), id, title.c_str());
+		fflush(stdout);
+		string ans;
+		if (!getline(cin, ans))
+		{
+			printf(tr("\n未确认（非交互环境请加 -y），已取消。\n", "\nNot confirmed (add -y in non-interactive use); cancelled.\n"));
+			return 1;
+		}
+		ans = lower(trim(ans));
+		if (ans != "y" && ans != "yes")
+		{
+			printf(tr("已取消。\n", "Cancelled.\n"));
+			return 0;
+		}
+	}
+
 	vector<Memo> ns;
 	ns.reserve(ms.size());
-	for (auto& m : ms)
-	{
-		if (m.id == id) found = true;
-		else ns.push_back(m);
-	}
-	if (!found) { printf(tr("找不到 #%lld\n", "memo #%lld not found\n"), id); return 1; }
+	for (auto& m : ms) if (m.id != id) ns.push_back(m);
 	save_memos(ns);
 
 	auto vs = load_vectors();
@@ -1630,9 +1692,10 @@ static bool parse_edit_file(const string& path, string& title, string& body)
 
 static int cmd_edit(vector<string>& args)
 {
-	if (args.empty()) { printf(tr("用法: edit <id>\n", "Usage: edit <id>\n")); return 1; }
-	ll id = atoll(args[0].c_str());
+	if (args.empty()) { printf(tr("用法: edit <id|标题片段>\n", "Usage: edit <id|title fragment>\n")); return 1; }
 	auto ms = load_memos();
+	ll id = 0;
+	if (!resolve_ref(ms, args[0], id)) return 1;
 	for (auto& m : ms) if (m.id == id)
 	{
 		g_last_active_id = id; // 被编辑即为上一个活跃备忘录
@@ -1915,6 +1978,72 @@ static int cmd_stop(vector<string>&)
 	return 0;
 }
 
+// ===================== 并发锁（REPL 实例互斥） =====================
+// 两个 REPL 同时写会产生重复 id / 相互覆盖 → data_dir/.lock 记录持有者 PID。
+// 崩溃残留的锁通过 PID 存活检测自愈；子命令模式不锁（运行短暂）。
+static string lock_path() { return data_dir() + "/.lock"; }
+static bool g_holds_lock = false;
+
+static ll pid_self()
+{
+#ifdef _WIN32
+	return (ll)GetCurrentProcessId();
+#else
+	return (ll)getpid();
+#endif
+}
+
+// PID 是否仍在运行（Unix: kill -0；Win: tasklist 过滤）
+static bool pid_alive(ll pid)
+{
+	if (pid <= 0) return false;
+#ifdef _WIN32
+	string cmd = "tasklist /FI \"PID eq " + to_string(pid) + "\" 2>" + NULL_DEV + " | find \"" + to_string(pid) + "\" >" + NULL_DEV;
+	return system(cmd.c_str()) == 0;
+#else
+	return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+#endif
+}
+
+// REPL 启动前获取锁：无锁/死锁残留 → 写入自己的 PID；活锁存在 → 询问是否仍继续
+static bool acquire_lock()
+{
+	ensure_data_dir();
+	ifstream f(lock_path());
+	if (f)
+	{
+		ll pid = 0;
+		f >> pid;
+		if (pid > 0 && pid_alive(pid))
+		{
+			printf(tr("警告：另一个实例正在运行（PID %lld），同时写会损坏数据。仍要继续？(y/N) ",
+			          "Warning: another instance is running (PID %lld); concurrent writes corrupt data. Continue anyway? (y/N) "), pid);
+			fflush(stdout);
+			string ans;
+			if (!getline(cin, ans) || (lower(trim(ans)) != "y" && lower(trim(ans)) != "yes"))
+			{
+				printf(tr("已退出。\n", "Exited.\n"));
+				return false;
+			}
+		}
+		// 锁残留（进程已死）或用户强制继续 → 覆盖
+		error_code ec;
+		filesystem::remove(lock_path(), ec);
+	}
+	ofstream o(lock_path(), ios::trunc);
+	o << pid_self() << "\n";
+	g_holds_lock = true;
+	return true;
+}
+
+static void release_lock()
+{
+	if (!g_holds_lock) return;
+	error_code ec;
+	filesystem::remove(lock_path(), ec);
+	g_holds_lock = false;
+}
+
 // ===================== 自更新（GitHub Release） =====================
 // "v1.2.3" → [1,2,3]（解析失败返回空）
 static vector<int> ver_parts(const string& v)
@@ -2166,21 +2295,23 @@ static void print_help()
 		"  add <标题> [正文...]\n"
 		"      新增一条备忘录。正文中的空行会把内容分成多个段落，每个段落独立计算向量；\n"
 		"      单个换行不换段。REPL 模式下若省略正文，则进入多行输入，单独一行 :end 结束。\n"
-		"  edit <id>\n"
-		"      用外部编辑器修改指定 id 的标题和正文，保存关闭后自动重算向量。\n"
+		"  edit <id|标题片段>\n"
+		"      用外部编辑器修改标题和正文，保存关闭后自动重算向量。\n"
 		"      编辑器顺序：config editor / $EDITOR > $VISUAL > 平台默认（Win: edit→notepad；Linux/macOS: nano→vi）。\n"
 		"      文件首行为标题，其后一行 ==== 分隔正文。\n"
-		"  delete <id>   删除指定 id（别名：del / rm）\n"
+		"  delete <id|标题片段> [-y]   删除（需确认，-y 跳过；别名：del / rm）\n"
 		"\n"
 		"  list   列出全部备忘录（别名：ls）\n"
-		"  show <id> [选项]\n"
-		"      查看指定 id 的内容。选项：\n"
+		"  show <id|标题片段> [选项]\n"
+		"      查看内容。选项：\n"
 		"      -f/--follow    显示上一个活跃的备忘录（add / edit / search 首命中 / find 首命中）\n"
 		"      -m/--markdown  渲染 Markdown（标题 / 粗体 / 斜体 / 代码 / 列表 / 引用）\n"
 		"      --limit=<n>L|P 只看前 n 行（L）或前 n 段（P）\n"
 		"      --from=<n>L|P  从第 n 行 / 段开始（1 起）\n"
 		"      --all          显示全部（过大时仍设上限，尽可能多显示）\n"
 		"      备忘录过大时默认只显示一部分；未显示完全会在首尾提示省略了多少。\n"
+		"      <id|标题片段>：纯数字按 id 查找；否则按标题片段（不区分大小写，须唯一命中）。\n"
+		"      edit / delete 同样支持。\n"
 		"\n"
 		"  search <关键词...> [--any] [-l|--list]\n"
 		"      多关键词子串搜索，不区分大小写。\n"
@@ -2282,8 +2413,9 @@ int main(int argc, char** argv)
 		return dispatch(toks);
 	}
 
-	// REPL 模式
+	// REPL 模式（先取锁：防两个实例并发写坏数据）
 	g_repl = true;
+	if (!acquire_lock()) return 1;
 	int dv = vec_schema_version_on_disk();
 	if (dv != 0 && dv < (int)VEC_SCHEMA_VERSION)
 		printf(tr("提示：向量格式已更新（旧 v%d → 新 v%d），请运行 reindex --all 重算。\n",
@@ -2301,5 +2433,6 @@ int main(int argc, char** argv)
 		if (toks[0] == "quit" || toks[0] == "exit" || toks[0] == "q") break;
 		dispatch(toks);
 	}
+	release_lock();
 	return 0;
 }

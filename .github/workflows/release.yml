@@ -1,0 +1,67 @@
+# 打 tag（v*）自动三平台构建并发布 Release
+# 产物名与 update 子命令的平台资产匹配规则对应：
+#   Windows: simple-memo.exe / Linux: simple-memo-linux / macOS: simple-memo-macos
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, artifact: simple-memo.exe }
+          - { os: ubuntu-latest, artifact: simple-memo-linux }
+          - { os: macos-latest, artifact: simple-memo-macos }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Windows, static)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: g++ -static -static-libgcc -static-libstdc++ -Wall -Wextra -O2 -std=c++17 simple-memo.cpp -o simple-memo.exe
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: g++ -Wall -Wextra -O2 -std=c++17 simple-memo.cpp -o simple-memo-linux
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: clang++ -Wall -Wextra -O2 -std=c++17 simple-memo.cpp -o simple-memo-macos
+
+      - name: Smoke test (help / ls / REPL lock)
+        shell: bash
+        env:
+          MEMO_DATA_DIR: ${{ runner.temp }}/smoke-data
+        run: |
+          "./${{ matrix.artifact }}" help > /dev/null
+          "./${{ matrix.artifact }}" ls > /dev/null
+          echo quit | "./${{ matrix.artifact }}" > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            simple-memo.exe simple-memo-linux simple-memo-macos \
+            --title "${{ github.ref_name }}" --generate-notes

@@ -9,10 +9,10 @@ CLI memo tool in a single C++ file: **title + body**, keyword search, and **loca
 | Command | Description |
 |---|---|
 | `add <title> [body...]` | Add a memo; blank lines split paragraphs, each gets its own vector |
-| `edit <id>` | Edit in external editor (`$EDITOR > $VISUAL > edit→notepad / nano→vi`), vectors recomputed on save |
-| `delete <id>` | Delete (`del` / `rm`) |
+| `edit <id|title>` | Edit in external editor (`$EDITOR > $VISUAL > edit→notepad / nano→vi`), vectors recomputed on save |
+| `delete <id|title> [-y]` | Delete with confirmation (`-y` skips; `del` / `rm`) |
 | `list` / `ls` | List all |
-| `show <id> [opts]` | Show: `-f` last active, `-m` markdown rendering, `--limit=nL/nP` + `--from=nL/nP` paging, `--all` everything (oversized memos auto-truncated with notice) |
+| `show <id|title> [opts]` | Show: `-f` last active, `-m` markdown rendering, `--limit=nL/nP` + `--from=nL/nP` paging, `--all` everything (oversized memos auto-truncated with notice) |
 | `search <kw...> [--any] [-l]` | Substring search (AND by default, `--any` for OR); prints hit lines with ±2 context |
 | `find <query> [-nK] [-l]` | Semantic search, per-paragraph Top-K |
 | `reindex [--all]` | Backfill pending vectors; `--all` rebuilds from scratch |
