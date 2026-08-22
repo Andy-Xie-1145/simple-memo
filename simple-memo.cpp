@@ -120,6 +120,37 @@ static string lower(const string& s)
 	return r;
 }
 
+// 原子写：先写 <path>.tmp 再 rename 替换 → 进程中途被杀不会留下半截文件
+// rename 同目录下原子（POSIX 保证；Win 的 MoveFileEx 也原子）
+static bool write_file_atomic(const string& path, const string& content)
+{
+	string tmp = path + ".tmp";
+	{
+		ofstream f(tmp, ios::binary | ios::trunc);
+		if (!f) return false;
+		f.write(content.data(), (streamsize)content.size());
+		if (!f.good()) { f.close(); error_code ec; filesystem::remove(tmp, ec); return false; }
+	}
+	error_code ec;
+	// Windows 上 rename 到已存在文件会失败 → 先删目标（此刻起短暂窗口，可接受：tmp 已完整）
+	filesystem::remove(path, ec);
+	filesystem::rename(tmp, path, ec);
+	if (ec) { filesystem::remove(tmp, ec); return false; }
+	return true;
+}
+
+// shell 参数转义：包引号，内部 " → \"，\ → \\（防路径含引号/特殊字符炸 system 命令行）
+static string shell_quote(const string& s)
+{
+	string r = "\"";
+	for (char c : s)
+	{
+		if (c == '"' || c == '\\') r += '\\';
+		r += c;
+	}
+	return r + "\"";
+}
+
 static string config_file() { return data_dir() + "/config.json"; }
 static const char* IGNORE_ENV_KEY = "@ignore_env";
 static int g_lang_cache = -1; // i18n 语言缓存（定义见 i18n 节；save 后失效）
@@ -524,13 +555,11 @@ static string json_escape(const string& s)
 }
 
 // ===================== 网络（curl 子进程） =====================
-// GET 取文本响应（用于查 GitHub release API）
-// 用 system 重定向到文件再读，避免 MinGW _popen 管道读取问题
-static string http_get(const string& url)
+// 统一 curl 执行：参数一律 shell_quote 转义，输出重定向到临时文件再读
+// （用 system 重定向避免 MinGW _popen 管道读取问题）
+static string curl_run(const string& args, const string& out)
 {
-	ensure_data_dir();
-	string out = data_dir() + "/.get.txt";
-	string cmd = "curl -s -L -m 60 -A \"simple-memo\" \"" + url + "\" > \"" + out + "\" 2>nul";
+	string cmd = "curl " + args + " > " + shell_quote(out) + " 2>" + NULL_DEV;
 	system(cmd.c_str());
 	string resp;
 	ifstream f(out, ios::binary);
@@ -538,10 +567,17 @@ static string http_get(const string& url)
 	return resp;
 }
 
-// GET 下载到文件（用于下载 llama.cpp release zip）
+// GET 取文本响应（用于查 GitHub release API）
+static string http_get(const string& url)
+{
+	ensure_data_dir();
+	return curl_run("-s -L -m 60 -A simple-memo " + shell_quote(url), data_dir() + "/.get.txt");
+}
+
+// GET 下载到文件（用于下载 llama.cpp release zip / 更新自身）
 static bool curl_download(const string& url, const string& dest)
 {
-	string cmd = "curl -s -L -m 600 --retry 2 -A \"simple-memo\" -o \"" + dest + "\" \"" + url + "\"";
+	string cmd = "curl -s -L -m 600 --retry 2 -A simple-memo -o " + shell_quote(dest) + " " + shell_quote(url);
 	int rc = system(cmd.c_str());
 	if (rc != 0) return false;
 	ifstream f(dest, ios::binary | ios::ate);
@@ -669,13 +705,8 @@ static string http_post_json(const string& url, const string& body)
 	ensure_data_dir();
 	string bf = data_dir() + "/.body.json";
 	{ ofstream f(bf, ios::binary); f << body; }
-	string out = data_dir() + "/.post.txt";
-	string cmd = "curl -s -m 60 -X POST -H \"Content-Type: application/json\" --data-binary \"@" + bf + "\" \"" + url + "\" > \"" + out + "\" 2>" + NULL_DEV;
-	system(cmd.c_str());
-	string resp;
-	ifstream f(out, ios::binary);
-	if (f) resp = string((istreambuf_iterator<char>(f)), istreambuf_iterator<char>());
-	return resp;
+	return curl_run("-s -m 60 -X POST -H Content-Type:application/json --data-binary @" + shell_quote(bf) + " " + shell_quote(url),
+	                data_dir() + "/.post.txt");
 }
 
 // llama-server 是否就绪（/health 返回 HTTP 200；模型加载中是 503）
@@ -683,7 +714,8 @@ static bool server_health()
 {
 	ensure_data_dir();
 	string codef = data_dir() + "/.code.txt";
-	string cmd = "curl -s -m 10 -w \"%{http_code}\" -o " + string(NULL_DEV) + " \"http://127.0.0.1:" + to_string(server_port()) + "/health\" > \"" + codef + "\" 2>" + NULL_DEV;
+	string args = "-s -m 10 -w %{http_code} -o " + string(NULL_DEV) + " " + shell_quote("http://127.0.0.1:" + to_string(server_port()) + "/health");
+	string cmd = "curl " + args + " > " + shell_quote(codef) + " 2>" + NULL_DEV;
 	system(cmd.c_str());
 	string code;
 	ifstream f(codef);
@@ -709,20 +741,16 @@ static bool ensure_server()
 	          "  Starting llama-server (first run downloads + loads the model; may take minutes)...\n"));
 	ensure_data_dir();
 	string logf = data_dir() + "/server.log";
+	string common = string(" --embedding")
+		+ " --host 127.0.0.1 --port " + to_string(server_port())
+		+ " -hf " + shell_quote(embed_hf_repo())
+		+ " --hf-file " + shell_quote(embed_hf_file());
 #ifdef _WIN32
-	string cmd = "start \"memo-embd\" /B \"" + llama_server_path() + "\""
-		+ " --embedding"
-		+ " --host 127.0.0.1 --port " + to_string(server_port())
-		+ " -hf \"" + embed_hf_repo() + "\""
-		+ " --hf-file \"" + embed_hf_file() + "\""
-		+ " > nul 2> \"" + logf + "\"";
+	string cmd = "start \"memo-embd\" /B " + shell_quote(llama_server_path()) + common
+		+ " > nul 2> " + shell_quote(logf);
 #else
-	string cmd = "(\"" + llama_server_path() + "\""
-		+ " --embedding"
-		+ " --host 127.0.0.1 --port " + to_string(server_port())
-		+ " -hf \"" + embed_hf_repo() + "\""
-		+ " --hf-file \"" + embed_hf_file() + "\""
-		+ " > /dev/null 2> \"" + logf + "\" &) ";
+	string cmd = "(" + shell_quote(llama_server_path()) + common
+		+ " > /dev/null 2> " + shell_quote(logf) + " &) ";
 #endif
 	system(cmd.c_str());
 
@@ -923,16 +951,18 @@ static vector<Memo> load_memos()
 static void save_memos(const vector<Memo>& ms)
 {
 	ensure_data_dir();
-	ofstream f(memos_path(), ios::binary | ios::trunc);
+	string buf;
+	buf.reserve(ms.size() * 128);
 	for (auto& m : ms)
 	{
-		f << "{\"id\":" << m.id
-		  << ",\"title\":" << json_escape(m.title)
-		  << ",\"body\":" << json_escape(m.body)
-		  << ",\"ctime\":" << json_escape(m.ctime)
-		  << ",\"vec_ok\":" << (m.vec_ok ? "true" : "false")
-		  << "}\n";
+		buf += "{\"id\":" + to_string(m.id)
+			+ ",\"title\":" + json_escape(m.title)
+			+ ",\"body\":" + json_escape(m.body)
+			+ ",\"ctime\":" + json_escape(m.ctime)
+			+ ",\"vec_ok\":" + (m.vec_ok ? "true" : "false")
+			+ "}\n";
 	}
+	write_file_atomic(memos_path(), buf);
 }
 
 static ll next_id(const vector<Memo>& ms)
@@ -1001,22 +1031,23 @@ static map<ll, VecSet> load_vectors()
 static void save_vectors(const map<ll, VecSet>& vs)
 {
 	ensure_data_dir();
-	ofstream f(vectors_path(), ios::binary | ios::trunc);
-	f.write(VEC_MAGIC, 4);
-	f.write((const char*)&VEC_SCHEMA_VERSION, sizeof(VEC_SCHEMA_VERSION));
+	string buf;
+	buf += string(VEC_MAGIC, 4);
+	buf.append((const char*)&VEC_SCHEMA_VERSION, sizeof(VEC_SCHEMA_VERSION));
 	for (auto& kv : vs)
 	{
 		uint64_t id = (uint64_t)kv.first;
 		uint32_t np = (uint32_t)kv.second.size();
-		f.write((const char*)&id, sizeof(id));
-		f.write((const char*)&np, sizeof(np));
+		buf.append((const char*)&id, sizeof(id));
+		buf.append((const char*)&np, sizeof(np));
 		for (auto& v : kv.second)
 		{
 			uint32_t dim = (uint32_t)v.size();
-			f.write((const char*)&dim, sizeof(dim));
-			if (dim) f.write((const char*)v.data(), (streamsize)dim * sizeof(float));
+			buf.append((const char*)&dim, sizeof(dim));
+			if (dim) buf.append((const char*)v.data(), (size_t)dim * sizeof(float));
 		}
 	}
+	write_file_atomic(vectors_path(), buf);
 }
 
 // 磁盘上向量文件的 schema 版本：0=不存在，1=旧 v1（无 magic），2=当前
@@ -1035,7 +1066,12 @@ static int vec_schema_version_on_disk()
 
 // ===================== 命令 =====================
 static bool g_repl = false; // REPL 模式下 add 无正文时读 stdin
-static ll g_last_active_id = 0; // 上一个活跃的备忘录（add/edit/search 首命中/find 首命中/show）
+// ---- 活跃备忘录（-f/--follow 的状态源） ----
+// 规则集中于此：add/edit/show/search 首命中/find 首命中 → touch；REPL 退出 → clear
+static ll g_last_active_id = 0;
+static void memo_touch(ll id) { g_last_active_id = id; }
+static ll memo_current() { return g_last_active_id; }
+static void memo_clear() { g_last_active_id = 0; }
 
 static int cmd_add(vector<string>& args)
 {
@@ -1067,7 +1103,7 @@ static int cmd_add(vector<string>& args)
 
 	auto ms = load_memos();
 	ll id = next_id(ms);
-	g_last_active_id = id; // 新增即为上一个活跃备忘录
+	memo_touch(id); // 新增即为上一个活跃备忘录
 	Memo m{ id, title, body, now_iso(), false };
 
 	// 按段落分别计算向量（空行分段，每段带标题前缀）
@@ -1298,15 +1334,15 @@ static int cmd_show(vector<string>& args)
 	}
 	if (follow && !has_id)
 	{
-		if (g_last_active_id == 0) { printf(tr("（还没有活跃备忘录：先 add / edit / search / find）\n", "(no active memo yet: try add / edit / search / find first)\n")); return 0; }
-		id = g_last_active_id;
+		if (memo_current() == 0) { printf(tr("（还没有活跃备忘录：先 add / edit / search / find）\n", "(no active memo yet: try add / edit / search / find first)\n")); return 0; }
+		id = memo_current();
 	}
 
 	auto ms = load_memos();
 	if (has_id && !resolve_ref(ms, ref, id)) return 1;
 	for (auto& m : ms) if (m.id == id)
 	{
-		g_last_active_id = id;
+		memo_touch(id);
 		printf("#%lld  %s\n", m.id, m.title.c_str());
 		printf(tr("  时间: %s   向量: %s\n", "  time: %s   vectors: %s\n"), m.ctime.c_str(), m.vec_ok ? tr("已生成", "ok") : tr("缺失", "missing"));
 
@@ -1698,7 +1734,7 @@ static int cmd_edit(vector<string>& args)
 	if (!resolve_ref(ms, args[0], id)) return 1;
 	for (auto& m : ms) if (m.id == id)
 	{
-		g_last_active_id = id; // 被编辑即为上一个活跃备忘录
+		memo_touch(id); // 被编辑即为上一个活跃备忘录
 		ensure_data_dir();
 		string tmp = data_dir() + "/.edit-" + to_string(id) + ".txt";
 		string editor = resolve_editor(); // 已含平台默认，永不为空
@@ -2433,6 +2469,7 @@ int main(int argc, char** argv)
 		if (toks[0] == "quit" || toks[0] == "exit" || toks[0] == "q") break;
 		dispatch(toks);
 	}
+	memo_clear(); // 退出 REPL 清除 --follow 追踪
 	release_lock();
 	return 0;
 }
