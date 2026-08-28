@@ -1086,14 +1086,26 @@ static void memo_clear() { g_last_active_id = 0; }
 
 static int cmd_add(vector<string>& args)
 {
-	if (args.empty()) { printf(tr("用法: add <标题> [正文...]\n", "Usage: add <title> [body...]\n")); return 1; }
-	string title = args[0];
-	string body;
-	for (size_t i = 1; i < args.size(); i++)
+	// 标题可含空格：首个独立分隔符（-- / | / ｜）之前全为标题，之后为正文；
+	// 无分隔符 → 整行即标题，REPL 下再交互输入正文；引号亦可强制分组
+	string title, body;
+	size_t sep = args.size();
+	for (size_t i = 0; i < args.size(); i++)
+		if (args[i] == "--" || args[i] == "|" || args[i] == "｜") { sep = i; break; }
+	for (size_t i = 0; i < sep; i++) { if (!title.empty()) title += " "; title += args[i]; }
+	for (size_t i = sep + 1; i < args.size(); i++) { if (!body.empty()) body += " "; body += args[i]; }
+
+	if (title.empty() && g_repl)
 	{
-		if (i > 1) body += " ";
-		body += args[i];
+		printf(tr("请输入标题：\n", "Enter title:\n"));
+		string line;
+		if (getline(cin, line))
+		{
+			while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+			title = line;
+		}
 	}
+	if (title.empty()) { printf(tr("用法: add <标题...> [-- 正文...]\n（标题可含空格；-- / | / ｜ 分隔正文；REPL 下可交互输入）\n", "Usage: add <title...> [-- body...]\n(title may contain spaces; -- / | / ｜ separates body; interactive in REPL)\n")); return 1; }
 	if (body.empty() && g_repl)
 	{
 		printf(tr("请输入正文（单独一行输入 :end 或 end 结束；或按 Ctrl+Z 回车结束）：\n",
@@ -2351,9 +2363,10 @@ static void print_help()
 	printf(
 		"简单备忘录 —— 命令帮助（版本 %s）\n"
 		"\n"
-		"  add <标题> [正文...]\n"
-		"      新增一条备忘录。正文中的空行会把内容分成多个段落，每个段落独立计算向量；\n"
-		"      单个换行不换段。REPL 模式下若省略正文，则进入多行输入，单独一行 :end 结束。\n"
+		"  add <标题...> [-- 正文...]\n"
+		"      新增一条备忘录。标题可含空格：整行即标题，用 -- / | / ｜ 分隔正文；\n"
+		"      也可用引号（add \"我的 标题\" 正文）。REPL 下省略正文则进入多行输入，单独一行 :end 结束。\n"
+		"      正文中的空行会把内容分成多个段落，每个段落独立计算向量；单个换行不换段。\n"
 		"  edit <id|标题片段>\n"
 		"      用外部编辑器修改标题和正文，保存关闭后自动重算向量。\n"
 		"      编辑器顺序：config editor / $EDITOR > $VISUAL > 平台默认（Win: edit→notepad；Linux/macOS: nano→vi）。\n"
