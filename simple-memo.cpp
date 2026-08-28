@@ -1763,16 +1763,24 @@ static bool parse_edit_file(const string& path, string& title, string& body)
 }
 
 // 打开编辑器编辑 标题+正文（首行标题，==== 分隔正文），成功返回 true 并回填；
-// 格式非法（缺 ==== / 标题为空）自动恢复内容并重开编辑器
+// 格式非法（缺 ==== / 标题为空）自动恢复内容并重开编辑器；
+// 新增（title 为空且非编辑既有）时预填占位标记提示输入位置
 static bool edit_title_body(string& title, string& body)
 {
 	ensure_data_dir();
 	string tmp = data_dir() + "/.edit-new.txt";
 	string editor = resolve_editor(); // 已含平台默认，永不为空
 
+	// 占位标记：提示输入位置，用户须替换/删除
+	const string ph_title = tr("【在此输入标题，删除本行提示】", "[Enter title here; delete this hint line]");
+	const string ph_body = tr("【在此输入正文，删除本行提示】", "[Enter body here; delete this hint line]");
+	bool fresh = title.empty() && body.empty(); // add -e 新增：预填标记；edit 修改：不预填
+	string ptitle = title.empty() && fresh ? ph_title : title;
+	string pbody = body.empty() && fresh ? ph_body : body;
+
 	for (;;)
 	{
-		write_edit_file(tmp, title, body);
+		write_edit_file(tmp, ptitle, pbody);
 
 		string cmd = editor + " \"" + tmp + "\""; // 允许 $EDITOR 带参数
 		int rc = system(cmd.c_str());
@@ -1788,11 +1796,18 @@ static bool edit_title_body(string& title, string& body)
 		          "  After saving and closing the editor, press Enter to continue...\n"));
 		fflush(stdout);
 		string dummy;
-		getline(cin, dummy);
+		if (!getline(cin, dummy) && cin.eof())
+		{
+			// stdin 已 EOF（管道/脚本环境）：无法交互重试，中止避免死循环
+			filesystem::remove(tmp);
+			printf(tr("输入流已结束，已取消编辑。\n", "Input stream ended; edit cancelled.\n"));
+			return false;
+		}
 
 		string nt, nb;
 		bool ok = parse_edit_file(tmp, nt, nb);
-		if (ok && !nt.empty())
+		bool hint_left = ok && (nt == ph_title || nb == ph_body); // 占位标记未删
+		if (ok && !nt.empty() && !hint_left)
 		{
 			filesystem::remove(tmp);
 			title = nt;
@@ -1801,7 +1816,9 @@ static bool edit_title_body(string& title, string& body)
 		}
 		printf(tr("  编辑结果无效（%s），已恢复原内容并重新打开编辑器。\n",
 		          "  Invalid edit result (%s); restored the original and reopened the editor.\n"),
-		       ok ? tr("标题为空", "empty title") : tr("缺少 ==== 分隔行", "missing ==== separator line"));
+		       !ok ? tr("缺少 ==== 分隔行", "missing ==== separator line")
+		           : hint_left ? tr("占位提示未删除或内容为空", "placeholder hint not removed or empty")
+		                       : tr("标题为空", "empty title"));
 	}
 }
 
@@ -1814,75 +1831,43 @@ static int cmd_edit(vector<string>& args)
 	for (auto& m : ms) if (m.id == id)
 	{
 		memo_touch(id); // 被编辑即为上一个活跃备忘录
-		ensure_data_dir();
-		string tmp = data_dir() + "/.edit-" + to_string(id) + ".txt";
-		string editor = resolve_editor(); // 已含平台默认，永不为空
 
-		for (;;)
+		string nt = m.title, nb = m.body;
+		if (!edit_title_body(nt, nb)) return 1; // 编辑器循环 + 格式校验全在公共函数里
+		if (nt == m.title && nb == m.body) { printf(tr("#%lld 未改动。\n", "#%lld unchanged.\n"), id); return 0; }
+		m.title = nt;
+		m.body = nb;
+
+		// 复用段落向量重算逻辑（同原实现）
+		auto paras = split_paragraphs(m.body);
+		auto vs = load_vectors();
+		VecSet set;
+		int ok_cnt = 0, fail_cnt = 0;
+		for (auto& p : paras)
 		{
-			write_edit_file(tmp, m.title, m.body);   // 每次重试重置为当前内容
-
-			string cmd = editor + " \"" + tmp + "\""; // 允许 $EDITOR 带参数
-			int rc = system(cmd.c_str());
-			if (rc != 0 && editor != default_editor())
-			{
-				printf(tr("  启动 %s 失败，回退到 %s。\n", "  Failed to launch %s; falling back to %s.\n"), editor.c_str(), default_editor().c_str());
-				editor = default_editor();
-				rc = system((editor + " \"" + tmp + "\"").c_str());
-			}
-
-			// 统一等待：不依赖编辑器是否阻塞
-			printf(tr("  编辑完成、保存并关闭编辑器后，请按回车继续……\n",
-			          "  After saving and closing the editor, press Enter to continue...\n"));
-			fflush(stdout);
-			string dummy;
-			getline(cin, dummy);
-
-			string nt, nb;
-			bool ok = parse_edit_file(tmp, nt, nb);
-			if (ok && !nt.empty())
-			{
-				filesystem::remove(tmp);
-				if (nt == m.title && nb == m.body) { printf(tr("#%lld 未改动。\n", "#%lld unchanged.\n"), id); return 0; }
-				m.title = nt;
-				m.body = nb;
-
-				// 复用段落向量重算逻辑（同原实现）
-				auto paras = split_paragraphs(m.body);
-				auto vs = load_vectors();
-				VecSet set;
-				int ok_cnt = 0, fail_cnt = 0;
-				for (auto& p : paras)
-				{
-					auto v = embed_text(doc_prompt(m.title, p));
-					if (!v.empty()) { set.push_back(v); ok_cnt++; }
-					else fail_cnt++;
-				}
-				if (fail_cnt == 0 && !set.empty())
-				{
-					m.vec_ok = true;
-					vs[id] = set;
-					save_memos(ms);
-					save_vectors(vs);
-					printf(tr("已编辑 #%lld 并重算向量（%d 段）。\n", "Edited #%lld and recomputed vectors (%d paras).\n"), id, ok_cnt);
-				}
-				else
-				{
-					m.vec_ok = false;
-					vs.erase(id); // 旧向量已过期（正文变了），清掉防脏数据
-					save_memos(ms);
-					save_vectors(vs);
-					printf(tr("已编辑 #%lld（embedding 失败 %d 段，标记 pending", "Edited #%lld (embedding failed for %d paras, marked pending"), id, fail_cnt);
-					if (!g_last_err.empty()) printf(tr("：%s", ": %s"), g_last_err.c_str());
-					printf(tr("）\n", ")\n"));
-				}
-				return 0;
-			}
-			// 格式非法：报错，重置并重试
-			printf(tr("  编辑结果无效（%s），已恢复原内容并重新打开编辑器。\n",
-			          "  Invalid edit result (%s); restored the original and reopened the editor.\n"),
-				ok ? tr("标题为空", "empty title") : tr("缺少 ==== 分隔行", "missing ==== separator line"));
+			auto v = embed_text(doc_prompt(m.title, p));
+			if (!v.empty()) { set.push_back(v); ok_cnt++; }
+			else fail_cnt++;
 		}
+		if (fail_cnt == 0 && !set.empty())
+		{
+			m.vec_ok = true;
+			vs[id] = set;
+			save_memos(ms);
+			save_vectors(vs);
+			printf(tr("已编辑 #%lld 并重算向量（%d 段）。\n", "Edited #%lld and recomputed vectors (%d paras).\n"), id, ok_cnt);
+		}
+		else
+		{
+			m.vec_ok = false;
+			vs.erase(id); // 旧向量已过期（正文变了），清掉防脏数据
+			save_memos(ms);
+			save_vectors(vs);
+			printf(tr("已编辑 #%lld（embedding 失败 %d 段，标记 pending", "Edited #%lld (embedding failed for %d paras, marked pending"), id, fail_cnt);
+			if (!g_last_err.empty()) printf(tr("：%s", ": %s"), g_last_err.c_str());
+			printf(tr("）\n", ")\n"));
+		}
+		return 0;
 	}
 	printf(tr("找不到 #%lld\n", "memo #%lld not found\n"), id);
 	return 1;
