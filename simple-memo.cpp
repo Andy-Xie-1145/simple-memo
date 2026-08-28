@@ -903,7 +903,6 @@ static vector<string> split_lines(const string& body)
 	}
 	if (body.empty()) return lines;
 	if (!cur.empty()) lines.push_back(cur);
-	else if (!lines.empty()) lines.pop_back(); // 正文以换行结尾 → 去掉尾空行
 	return lines;
 }
 
@@ -1084,44 +1083,58 @@ static void memo_touch(ll id) { g_last_active_id = id; }
 static ll memo_current() { return g_last_active_id; }
 static void memo_clear() { g_last_active_id = 0; }
 
+static bool edit_title_body(string& title, string& body); // 定义在后（复用编辑器解析等工具）
+
 static int cmd_add(vector<string>& args)
 {
-	// 标题可含空格：首个独立分隔符（-- / | / ｜）之前全为标题，之后为正文；
-	// 无分隔符 → 整行即标题，REPL 下再交互输入正文；引号亦可强制分组
+	// add [-e] [标题... -- 正文...]
+	// -e     直接打开编辑器（首行标题，==== 分隔正文，同 edit）
+	// --     分隔标题与正文（标题可含空格）
+	// 无 -e 无 -- 时整行即标题；REPL 下可交互输入标题与正文
+	bool use_editor = !args.empty() && args[0] == "-e";
+	if (use_editor) args.erase(args.begin());
+
 	string title, body;
 	size_t sep = args.size();
 	for (size_t i = 0; i < args.size(); i++)
-		if (args[i] == "--" || args[i] == "|" || args[i] == "｜") { sep = i; break; }
+		if (args[i] == "--") { sep = i; break; }
 	for (size_t i = 0; i < sep; i++) { if (!title.empty()) title += " "; title += args[i]; }
 	for (size_t i = sep + 1; i < args.size(); i++) { if (!body.empty()) body += " "; body += args[i]; }
 
-	if (title.empty() && g_repl)
+	if (use_editor)
 	{
-		printf(tr("请输入标题：\n", "Enter title:\n"));
-		string line;
-		if (getline(cin, line))
-		{
-			while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
-			title = line;
-		}
+		if (!edit_title_body(title, body)) return 1;
 	}
-	if (title.empty()) { printf(tr("用法: add <标题...> [-- 正文...]\n（标题可含空格；-- / | / ｜ 分隔正文；REPL 下可交互输入）\n", "Usage: add <title...> [-- body...]\n(title may contain spaces; -- / | / ｜ separates body; interactive in REPL)\n")); return 1; }
-	if (body.empty() && g_repl)
+	else
 	{
-		printf(tr("请输入正文（单独一行输入 :end 或 end 结束；或按 Ctrl+Z 回车结束）：\n",
-		          "Enter body (finish with a lone :end or end line; or Ctrl+Z then Enter):\n"));
-		string line;
-		while (getline(cin, line))
+		if (title.empty() && g_repl)
 		{
-			// 去掉行尾 \r/空白（兼容 Windows CRLF、误输空格等）
-			while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
-				line.pop_back();
-			string tl = lower(line);
-			if (tl == ":end" || tl == "end" || tl == "：end" || tl == ".end") break;
-			if (!body.empty()) body += "\n";
-			body += line;
+			printf(tr("请输入标题：\n", "Enter title:\n"));
+			string line;
+			if (getline(cin, line))
+			{
+				while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+				title = line;
+			}
 		}
-		cin.clear();
+		if (title.empty()) { printf(tr("用法: add [-e] <标题...> [-- 正文...]\n（-e 打开编辑器；-- 分隔正文；标题可含空格）\n", "Usage: add [-e] <title...> [-- body...]\n(-e opens the editor; -- separates body; title may contain spaces)\n")); return 1; }
+		if (body.empty() && g_repl)
+		{
+			printf(tr("请输入正文（单独一行输入 :end 或 end 结束；或按 Ctrl+Z 回车结束）：\n",
+			          "Enter body (finish with a lone :end or end line; or Ctrl+Z then Enter):\n"));
+			string line;
+			while (getline(cin, line))
+			{
+				// 去掉行尾 \r/空白（兼容 Windows CRLF、误输空格等）
+				while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
+					line.pop_back();
+				string tl = lower(line);
+				if (tl == ":end" || tl == "end" || tl == "：end" || tl == ".end") break;
+				if (!body.empty()) body += "\n";
+				body += line;
+			}
+			cin.clear();
+		}
 	}
 
 	auto ms = load_memos();
@@ -1749,6 +1762,49 @@ static bool parse_edit_file(const string& path, string& title, string& body)
 	return true;
 }
 
+// 打开编辑器编辑 标题+正文（首行标题，==== 分隔正文），成功返回 true 并回填；
+// 格式非法（缺 ==== / 标题为空）自动恢复内容并重开编辑器
+static bool edit_title_body(string& title, string& body)
+{
+	ensure_data_dir();
+	string tmp = data_dir() + "/.edit-new.txt";
+	string editor = resolve_editor(); // 已含平台默认，永不为空
+
+	for (;;)
+	{
+		write_edit_file(tmp, title, body);
+
+		string cmd = editor + " \"" + tmp + "\""; // 允许 $EDITOR 带参数
+		int rc = system(cmd.c_str());
+		if (rc != 0 && editor != default_editor())
+		{
+			printf(tr("  启动 %s 失败，回退到 %s。\n", "  Failed to launch %s; falling back to %s.\n"), editor.c_str(), default_editor().c_str());
+			editor = default_editor();
+			rc = system((editor + " \"" + tmp + "\"").c_str());
+		}
+
+		// 统一等待：不依赖编辑器是否阻塞
+		printf(tr("  编辑完成、保存并关闭编辑器后，请按回车继续……\n",
+		          "  After saving and closing the editor, press Enter to continue...\n"));
+		fflush(stdout);
+		string dummy;
+		getline(cin, dummy);
+
+		string nt, nb;
+		bool ok = parse_edit_file(tmp, nt, nb);
+		if (ok && !nt.empty())
+		{
+			filesystem::remove(tmp);
+			title = nt;
+			body = nb;
+			return true;
+		}
+		printf(tr("  编辑结果无效（%s），已恢复原内容并重新打开编辑器。\n",
+		          "  Invalid edit result (%s); restored the original and reopened the editor.\n"),
+		       ok ? tr("标题为空", "empty title") : tr("缺少 ==== 分隔行", "missing ==== separator line"));
+	}
+}
+
 static int cmd_edit(vector<string>& args)
 {
 	if (args.empty()) { printf(tr("用法: edit <id|标题片段>\n", "Usage: edit <id|title fragment>\n")); return 1; }
@@ -2363,9 +2419,10 @@ static void print_help()
 	printf(
 		"简单备忘录 —— 命令帮助（版本 %s）\n"
 		"\n"
-		"  add <标题...> [-- 正文...]\n"
-		"      新增一条备忘录。标题可含空格：整行即标题，用 -- / | / ｜ 分隔正文；\n"
-		"      也可用引号（add \"我的 标题\" 正文）。REPL 下省略正文则进入多行输入，单独一行 :end 结束。\n"
+		"  add [-e] <标题...> [-- 正文...]\n"
+		"      新增一条备忘录。标题可含空格（整行即标题），-- 分隔正文；\n"
+		"      -e 直接打开编辑器（首行标题，==== 分隔正文，同 edit）。\n"
+		"      REPL 下省略正文则进入多行输入，单独一行 :end 结束。\n"
 		"      正文中的空行会把内容分成多个段落，每个段落独立计算向量；单个换行不换段。\n"
 		"  edit <id|标题片段>\n"
 		"      用外部编辑器修改标题和正文，保存关闭后自动重算向量。\n"

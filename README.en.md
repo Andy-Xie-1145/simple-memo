@@ -8,7 +8,7 @@ CLI memo tool in a single C++ file: **title + body**, keyword search, and **loca
 
 | Command | Description |
 |---|---|
-| `add <title...> [-- body...]` | Add a memo; title may contain spaces (separate body with `--` or quote the title); blank lines split paragraphs, each gets its own vector |
+| `add [-e] <title...> [-- body...]` | Add a memo; title may contain spaces, `--` separates body; `-e` opens the editor directly (same format as edit); blank lines split paragraphs, each gets its own vector |
 | `edit <id|title>` | Edit in external editor (`$EDITOR > $VISUAL > edit→notepad / nano→vi`), vectors recomputed on save |
 | `delete <id|title> [-y]` | Delete with confirmation (`-y` skips; `del` / `rm`) |
 | `list` / `ls` | List all |
